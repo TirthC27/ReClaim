@@ -1,8 +1,12 @@
 """
 Project Flow — FastAPI application entry-point.
 
-Registers all routers and configures CORS for local dev.
+Registers all routers, configures CORS, and starts the
+abandonment detection scheduler on startup.
 """
+
+import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,12 +23,30 @@ from app.routers import (
     shopify,
     merchant_onboarding,
     merchant_documents,
+    webhooks,
+    offer_generation,
 )
+from app.services.abandonment_worker import start_scheduler, stop_scheduler
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the abandonment scheduler on startup, stop on shutdown."""
+    start_scheduler()
+    yield
+    stop_scheduler()
+
 
 app = FastAPI(
     title="Project Flow",
-    description="Multi-vendor agentic demand-recovery marketplace — backend skeleton",
-    version="0.1.0",
+    description="Multi-vendor agentic demand-recovery marketplace",
+    version="0.2.0",
+    lifespan=lifespan,
 )
 
 # ── CORS (permissive for local dev) ──────────────────────────
@@ -48,3 +70,5 @@ app.include_router(payments.router)
 app.include_router(shopify.router)
 app.include_router(merchant_onboarding.router)
 app.include_router(merchant_documents.router)
+app.include_router(webhooks.router)
+app.include_router(offer_generation.router)
