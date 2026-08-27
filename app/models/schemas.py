@@ -162,6 +162,7 @@ class DemandPoolRead(_TimestampMixin):
     signal_count: int
     status: str
     threshold: int
+    selected_merchant_ids: list[str] | None = None
     updated_at: datetime | None = None
 
 

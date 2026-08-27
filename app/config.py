@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     SHOPIFY_ADMIN_TOKEN: str = ""
     SHOPIFY_CLIENT_ID: str = ""
     SHOPIFY_CLIENT_SECRET: str = ""
+    SHOPIFY_WEBHOOK_SECRET: str = ""
+
+    # Abandonment detection
+    ABANDONMENT_TIMEOUT_MINUTES: int = 2  # 1-2 for demo, 10+ for production
+
+    # Section 9A merchant selection — PLACEHOLDER VALUES pending final formula
+    SMALL_POOL_THRESHOLD: int = 5       # pools below this → single best merchant
+    DEMAND_PER_MERCHANT: int = 5        # signals-per-merchant ratio for large pools
+    TIE_TOLERANCE_PCT: float = 3.0      # 9A.2: ±% of top score = "genuinely comparable"
 
     # Server
     PORT: int = 8000
