@@ -12,10 +12,11 @@ router = APIRouter(prefix="/offers", tags=["offers"])
 @router.get("", response_model=list[OfferRead])
 def list_offers(
     pool_id: UUID | None = Query(default=None),
+    status: str | None = Query(default=None),
     limit: int = 100,
     offset: int = 0,
 ):
-    return svc.list_offers(pool_id=pool_id, limit=limit, offset=offset)
+    return svc.list_offers(pool_id=pool_id, status=status, limit=limit, offset=offset)
 
 
 @router.get("/{offer_id}", response_model=OfferRead)

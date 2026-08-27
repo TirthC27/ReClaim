@@ -7,10 +7,12 @@ from app.db.client import get_supabase
 TABLE = "offers"
 
 
-def list_offers(pool_id: UUID | None = None, limit: int = 100, offset: int = 0) -> list[dict]:
+def list_offers(pool_id: UUID | None = None, status: str | None = None, limit: int = 100, offset: int = 0) -> list[dict]:
     q = get_supabase().table(TABLE).select("*")
     if pool_id:
         q = q.eq("demand_pool_id", str(pool_id))
+    if status:
+        q = q.eq("status", status)
     return q.range(offset, offset + limit - 1).execute().data
 
 
