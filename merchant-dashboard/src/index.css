@@ -1,0 +1,8 @@
+/* Global reset — minimal, since App.css does the heavy lifting */
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+}
