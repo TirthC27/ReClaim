@@ -1,15 +1,151 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   fetchShopifyProducts,
   linkProducts,
   fetchProductGroups,
+  searchProductGroups,
+  createProductGroup,
 } from "../api";
+
+function SearchableGroupSelect({ productTitle, defaultGroups, onSelectGroup }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
+  const [isOpen, setIsOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const wrapperRef = useRef(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    
+    if (query.length < 2) {
+      setResults(defaultGroups);
+      return;
+    }
+    
+    setLoading(true);
+    const timer = setTimeout(() => {
+      searchProductGroups(query)
+        .then(setResults)
+        .catch(console.error)
+        .finally(() => setLoading(false));
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [query, isOpen, defaultGroups]);
+
+  // Click outside to close
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target)) {
+        setIsOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const handleSelect = (group) => {
+    setQuery(group.model_name);
+    onSelectGroup(group.id);
+    setIsOpen(false);
+  };
+
+  const handleCreateNew = async () => {
+    const sku = productTitle
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+      
+    setLoading(true);
+    try {
+      const newGroup = await createProductGroup({
+        model_name: query,
+        canonical_sku: sku,
+      });
+      // Force update of results so the newly created group shows up in subsequent searches
+      setResults((prev) => [newGroup, ...prev]);
+      handleSelect(newGroup);
+    } catch (err) {
+      console.error("Failed to create group:", err);
+      alert("Failed to create new product group: " + err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const exactMatch = results.some(r => r.model_name.toLowerCase() === query.toLowerCase());
+
+  return (
+    <div ref={wrapperRef} style={{ position: "relative", width: "100%" }}>
+      <input
+        type="text"
+        placeholder="Search or type new group name..."
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setIsOpen(true);
+          // clear parent selection when typing to force a new selection
+          onSelectGroup(null);
+        }}
+        onFocus={() => setIsOpen(true)}
+        className="input-field"
+        style={{ width: "100%", padding: "8px", boxSizing: "border-box" }}
+      />
+      
+      {isOpen && (
+        <ul
+          style={{
+            position: "absolute",
+            top: "100%",
+            left: 0,
+            right: 0,
+            background: "var(--bg-primary, white)",
+            border: "1px solid var(--border, #ccc)",
+            maxHeight: 200,
+            overflowY: "auto",
+            zIndex: 10,
+            listStyle: "none",
+            margin: 0,
+            padding: 0,
+            boxShadow: "0 4px 6px rgba(0,0,0,0.1)",
+          }}
+        >
+          {loading && <li style={{ padding: 8, color: "var(--text-muted, #666)" }}>Loading...</li>}
+          
+          {results.map((g) => (
+            <li
+              key={g.id}
+              onClick={() => handleSelect(g)}
+              style={{ padding: 8, cursor: "pointer", borderBottom: "1px solid var(--border, #eee)", color: "var(--text-primary, black)" }}
+            >
+              {g.model_name} <span style={{color: "var(--text-muted, #888)", fontSize: "0.85em"}}>{g.canonical_sku}</span>
+            </li>
+          ))}
+          
+          {!exactMatch && query.length > 0 && (
+            <li
+              onClick={handleCreateNew}
+              style={{
+                padding: 8,
+                cursor: "pointer",
+                background: "var(--bg-secondary, #f0f8ff)",
+                color: "var(--primary, #0066cc)",
+                fontWeight: "bold",
+              }}
+            >
+              + Create new group: "{query}"
+            </li>
+          )}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 export default function ProductLinking({ merchant, onComplete }) {
   const [products, setProducts] = useState([]);
   const [groups, setGroups] = useState([]);
   const [assignments, setAssignments] = useState({});
-  const [newGroups, setNewGroups] = useState({});
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -31,28 +167,12 @@ export default function ProductLinking({ merchant, onComplete }) {
       });
   }, [merchant.id]);
 
-  const handleGroupChange = (productId, value) => {
-    if (value === "__new__") {
-      setAssignments((prev) => ({ ...prev, [productId]: null }));
-      setNewGroups((prev) => ({
-        ...prev,
-        [productId]: { canonical_sku: "", model_name: "" },
-      }));
-    } else {
-      setAssignments((prev) => ({ ...prev, [productId]: value || null }));
-      setNewGroups((prev) => {
-        const copy = { ...prev };
-        delete copy[productId];
-        return copy;
-      });
-    }
-  };
-
-  const handleNewGroupField = (productId, field, value) => {
-    setNewGroups((prev) => ({
-      ...prev,
-      [productId]: { ...prev[productId], [field]: value },
-    }));
+  const handleGroupSelect = (productId, groupId) => {
+    setAssignments((prev) => {
+      const newGroupId = groupId || null;
+      if (prev[productId] === newGroupId) return prev;
+      return { ...prev, [productId]: newGroupId };
+    });
   };
 
   const handleSubmit = async () => {
@@ -64,7 +184,7 @@ export default function ProductLinking({ merchant, onComplete }) {
       const entry = {
         shopify_product_id: pid,
         product_group_id: assignments[pid] || null,
-        new_group: newGroups[pid] || null,
+        new_group: null, // we no longer use the inline new_group creation feature on the backend, groups are created via API immediately
       };
       return entry;
     });
@@ -148,55 +268,11 @@ export default function ProductLinking({ merchant, onComplete }) {
                   </div>
 
                   <div className="product-group-select">
-                    <select
-                      value={
-                        newGroups[pid]
-                          ? "__new__"
-                          : assignments[pid] || ""
-                      }
-                      onChange={(e) =>
-                        handleGroupChange(pid, e.target.value)
-                      }
-                    >
-                      <option value="">— Select group —</option>
-                      {groups.map((g) => (
-                        <option key={g.id} value={g.id}>
-                          {g.model_name}
-                          {g.canonical_sku && ` (${g.canonical_sku})`}
-                        </option>
-                      ))}
-                      <option value="__new__">+ Create new group</option>
-                    </select>
-
-                    {newGroups[pid] && (
-                      <div className="new-group-fields">
-                        <input
-                          type="text"
-                          placeholder="Model name (e.g. Dell XPS 15 2024)"
-                          value={newGroups[pid].model_name}
-                          onChange={(e) =>
-                            handleNewGroupField(
-                              pid,
-                              "model_name",
-                              e.target.value
-                            )
-                          }
-                          required
-                        />
-                        <input
-                          type="text"
-                          placeholder="Canonical SKU (optional)"
-                          value={newGroups[pid].canonical_sku}
-                          onChange={(e) =>
-                            handleNewGroupField(
-                              pid,
-                              "canonical_sku",
-                              e.target.value
-                            )
-                          }
-                        />
-                      </div>
-                    )}
+                    <SearchableGroupSelect
+                      productTitle={p.title}
+                      defaultGroups={groups}
+                      onSelectGroup={(id) => handleGroupSelect(pid, id)}
+                    />
                   </div>
                 </div>
               );
@@ -207,6 +283,7 @@ export default function ProductLinking({ merchant, onComplete }) {
             className="btn btn-primary"
             onClick={handleSubmit}
             disabled={submitting}
+            style={{ marginTop: 16 }}
           >
             {submitting ? (
               <>

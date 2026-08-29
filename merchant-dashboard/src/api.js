@@ -2,7 +2,8 @@
  * API client for the Project Flow backend.
  */
 
-const API_BASE = "http://localhost:8000";
+const API_BASE =
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 async function request(path, options = {}) {
   const url = `${API_BASE}${path}`;
@@ -62,3 +63,35 @@ export const fetchDocuments = (merchantId) =>
 
 // ── Product Groups ─────────────────────────────────────────
 export const fetchProductGroups = () => request("/product-groups");
+
+export const searchProductGroups = (q) =>
+  request(`/product-groups/search?q=${encodeURIComponent(q)}`);
+
+export const createProductGroup = (data) =>
+  request("/product-groups", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const fetchDemandPools = () => request("/demand-pools");
+
+export const fetchAllocations = (poolId) => request(`/demand-pools/${poolId}/allocations`);
+
+export const fetchOffers = (poolId, status) => {
+  const qs = new URLSearchParams({ pool_id: poolId });
+  if (status) qs.set("status", status);
+  return request(`/offers?${qs.toString()}`);
+};
+
+export const selectOffer = (offerId, demandSignalId) =>
+  request(`/offers/${offerId}/select`, {
+    method: "POST",
+    body: JSON.stringify({ demand_signal_id: demandSignalId }),
+  });
+
+export const fetchOrder = (orderId) => request(`/orders/${orderId}`);
+
+export const generateOffers = (poolId) =>
+  request(`/demand-pools/${poolId}/generate-offers`, {
+    method: "POST",
+  });
