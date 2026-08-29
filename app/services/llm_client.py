@@ -17,10 +17,10 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://openrouter.ai/api/v1"
 
 # Model assignments
-STEP1_MODELS = ["deepseek/deepseek-chat-v3-0324:free"]
+STEP1_MODELS = ["upstage/solar-pro4"]
 STEP2_MODELS = [
-    "deepseek/deepseek-chat-v3-0324:free",
-    "qwen/qwen3-235b-a22b:free",
+    "upstage/solar-pro4",
+    "qwen/qwen3-235b-a22b-2507",
     "google/gemini-2.5-flash-preview-05-20",
 ]
 

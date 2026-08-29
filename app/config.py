@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # Razorpay
     RAZORPAY_KEY_ID: str = ""
     RAZORPAY_KEY_SECRET: str = ""
+    RAZORPAY_WEBHOOK_SECRET: str = ""
+
+    FRONTEND_BASE_URL: str = "http://localhost:5173"
 
     # OpenRouter (LLM)
     OPENROUTER_API_KEY: str = ""
@@ -39,6 +42,9 @@ class Settings(BaseSettings):
     SMALL_POOL_THRESHOLD: int = 5       # pools below this → single best merchant
     DEMAND_PER_MERCHANT: int = 5        # signals-per-merchant ratio for large pools
     TIE_TOLERANCE_PCT: float = 3.0      # 9A.2: ±% of top score = "genuinely comparable"
+
+    # Payment link expiry
+    PAYMENT_EXPIRY_HOURS: int = 8        # Razorpay payment link TTL
 
     # Server
     PORT: int = 8000
