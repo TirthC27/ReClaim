@@ -215,7 +215,7 @@ class OfferCreate(BaseModel):
     merchant_id: UUID
     offer_type: str
     price: float | None = None
-    bundled_items: dict[str, Any] | None = None
+    bundled_items: list[str] | None = None
     description: str | None = None
     strategy_reasoning: dict[str, Any] | None = None
     status: str = "candidate"
@@ -227,25 +227,43 @@ class OfferRead(_TimestampMixin):
     merchant_id: UUID
     offer_type: str
     price: float | None = None
-    bundled_items: dict[str, Any] | None = None
+    bundled_items: list[str] | None = None
     description: str | None = None
     strategy_reasoning: dict[str, Any] | None = None
     status: str
+    buyer_rank: int | None = None
 
 
 # ── orders ───────────────────────────────────────────────────
 
+class OfferSelectRequest(BaseModel):
+    demand_signal_id: UUID
+
+
+class OfferSelectResponse(BaseModel):
+    order_id: UUID
+    payment_link_url: str
+
+
 class OrderCreate(BaseModel):
     offer_id: UUID
+    demand_signal_id: UUID | None = None
+    merchant_id: UUID | None = None
     shopify_order_id: str | None = None
     status: str = "pending_payment"
+    order_creation_failed: bool | None = None
+    last_shopify_error: str | None = None
 
 
 class OrderRead(_TimestampMixin):
     id: UUID
     offer_id: UUID
+    demand_signal_id: UUID | None = None
+    merchant_id: UUID | None = None
     shopify_order_id: str | None = None
     status: str
+    order_creation_failed: bool | None = None
+    last_shopify_error: str | None = None
     updated_at: datetime | None = None
 
 

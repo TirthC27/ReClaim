@@ -23,6 +23,9 @@ class OnboardRequest(BaseModel):
     name: str
     shopify_vendor_name: str
     margin_floor_pct: float | None = None
+    stock_data: dict[str, Any] | None = None
+    accessory_inventory: dict[str, Any] | None = None
+    warranty_cost_data: dict[str, Any] | None = None
 
 
 class NewGroup(BaseModel):

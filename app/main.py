@@ -24,7 +24,9 @@ from app.routers import (
     merchant_onboarding,
     merchant_documents,
     webhooks,
+    razorpay_webhooks,
     offer_generation,
+    demand_signals,
 )
 from app.services.abandonment_worker import start_scheduler, stop_scheduler
 
@@ -52,7 +54,7 @@ app = FastAPI(
 # ── CORS (permissive for local dev) ──────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://reclaim-t5ldhxld.myshopify.com", "http://localhost:5173", "http://localhost:3000", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -71,4 +73,6 @@ app.include_router(shopify.router)
 app.include_router(merchant_onboarding.router)
 app.include_router(merchant_documents.router)
 app.include_router(webhooks.router)
+app.include_router(razorpay_webhooks.router)
 app.include_router(offer_generation.router)
+app.include_router(demand_signals.router)
