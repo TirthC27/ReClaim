@@ -10,7 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException
 
 from app.services.offer_engine import run_offer_generation
-from app.services.allocation import run_allocation
+from app.services.allocation import allocate_orders_for_pool
 from app.services import demand as demand_svc
 
 router = APIRouter(tags=["offer-generation"])
@@ -40,8 +40,12 @@ async def generate_offers(pool_id: UUID):
     # If we have validated offers, run allocation
     if result.get("offers_generated", 0) > 0:
         try:
-            allocation_result = run_allocation(str(pool_id))
-            result["allocation"] = allocation_result
+            allocation_result = allocate_orders_for_pool(
+                pool_id=str(pool_id),
+                product_id=pool["product_group_id"],
+                total_demand_qty=pool.get("signal_count", 0)
+            )
+            result["buyer_agent"] = allocation_result
         except Exception as exc:
             result["allocation_error"] = str(exc)
 

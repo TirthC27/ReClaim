@@ -19,6 +19,19 @@ def list_product_groups(limit: int = 100, offset: int = 0) -> list[dict]:
     )
 
 
+def search_product_groups(query: str, limit: int = 10) -> list[dict]:
+    """Fuzzy search groups by model_name for UI auto-complete."""
+    return (
+        get_supabase()
+        .table(TABLE)
+        .select("*")
+        .ilike("model_name", f"%{query}%")
+        .limit(limit)
+        .execute()
+        .data
+    )
+
+
 def get_product_group(group_id: UUID) -> dict | None:
     rows = (
         get_supabase()

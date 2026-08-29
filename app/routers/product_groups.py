@@ -14,6 +14,13 @@ def list_product_groups(limit: int = 100, offset: int = 0):
     return svc.list_product_groups(limit=limit, offset=offset)
 
 
+@router.get("/search", response_model=list[ProductGroupRead])
+def search_product_groups(q: str, limit: int = 10):
+    if len(q) < 2:
+        return []
+    return svc.search_product_groups(q, limit=limit)
+
+
 @router.post("", response_model=ProductGroupRead, status_code=201)
 def create_product_group(body: ProductGroupCreate):
     return svc.create_product_group(body.model_dump(exclude_none=True))

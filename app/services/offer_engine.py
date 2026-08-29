@@ -1,7 +1,7 @@
 """
 Offer engine — 2-step LLM agent pipeline + deterministic validator.
 
-Step 1: Feasibility & Strategy (DeepSeek)
+Step 1: Feasibility & Strategy (DeepSeek) — NOW RAG-augmented with merchant docs
 Step 2: Offer Composer (Qwen → Gemini fallback, RAG-augmented)
 Step 3: Validator/Finalizer (deterministic)
 Orchestrator: run all merchants concurrently with failure isolation
@@ -20,20 +20,40 @@ from app.services.aggregation import get_selected_merchants
 
 logger = logging.getLogger(__name__)
 
-# ── System prompts (exact text from spec) ────────────────────
+# ── System prompts ───────────────────────────────────────────
 
-STEP1_SYSTEM_PROMPT = """You are a merchant's commercial strategy assistant. Given this merchant's stock, \
-margin floor, available accessories, and warranty costs, plus the size of a demand \
-opportunity, determine the merchant's strategic leaning: how much price flexibility \
+STEP1_SYSTEM_PROMPT = """\
+You are a merchant's commercial strategy assistant. You are given:
+1. The merchant's database record (margin floor, stock, accessories, warranty costs — some may be null)
+2. Relevant data retrieved from the merchant's own uploaded documents (quotation CSVs, price lists, etc.)
+3. The demand opportunity (product title, price, quantity)
+
+Your job: determine the merchant's strategic leaning — how much price flexibility \
 exists, which non-price levers (gifts/bundles/warranty) are most economically \
-sensible, and overall risk appetite for this opportunity. Do NOT propose a final \
-offer yet — output only a structured strategy assessment. Respond in valid JSON only."""
+sensible, and overall risk appetite for this opportunity.
 
-STEP2_SYSTEM_PROMPT = """You are a merchant agent composing a customer-facing offer. You have this merchant's \
+IMPORTANT: Use the retrieved document data as your PRIMARY source for stock, cost, \
+and margin information. The merchant record fields may be null even when the data \
+IS available in the retrieved documents. Only mark a field as "missing" if it truly \
+isn't present in EITHER the merchant record OR the retrieved documents.
+
+Do NOT propose a final offer yet — output only a structured strategy assessment.
+Respond in valid JSON only."""
+
+STEP2_SYSTEM_PROMPT = """\
+You are a merchant agent composing a customer-facing offer. You have this merchant's \
 strategic assessment and relevant reference context (this merchant's own quotation \
-documents, similar product data, and past offer patterns). Compose ONE concrete offer: \
-a specific price, any bundled items, and a short customer-facing description. Stay \
-within the strategy's max_discount_pct. Respond in valid JSON only."""
+documents, similar product data, and past offer patterns). Compose ONE concrete offer.
+
+Respond with a JSON object containing EXACTLY these keys:
+- "offer_type": one of "discount", "gift", "bundle", "warranty", "upgrade", "service", "hybrid"
+- "price": the final offer price as a number (must respect strategy's max_discount_pct)
+- "bundled_items": array of strings listing any freebies or bundled extras (empty array if none)
+- "description": a short, compelling, customer-facing sentence describing this offer, \
+e.g. "Best Price: ₹26,990 + Free Wireless Mouse" or "Protection Deal: ₹28,500 with 2-Year Extended Warranty"
+
+The description MUST be non-empty and should highlight the key value proposition.
+Respond in valid JSON only."""
 
 # Marketplace display categories (Section 12)
 OFFER_CATEGORIES = {
@@ -45,6 +65,51 @@ OFFER_CATEGORIES = {
     "service": "Best Value",
     "hybrid": "Best Value",
 }
+
+
+def _build_fallback_description(
+    offer_type: str,
+    price: float,
+    bundled_items: list | None = None,
+    product_title: str = "",
+) -> str:
+    """
+    Construct a customer-facing description when the LLM returns an empty one.
+
+    Examples:
+        "Best Price: ₹26,990 + Free Wireless Mouse"
+        "Bundle: ₹27,200 with 1-Year Extended Warranty + Braided AUX Cable"
+        "Discount: ₹58,500"
+    """
+    category = OFFER_CATEGORIES.get(offer_type, "Best Value")
+    price_str = f"₹{price:,.0f}"
+    parts = [f"{category}: {price_str}"]
+
+    if bundled_items:
+        items_str = " + ".join(str(b) for b in bundled_items[:3])  # Cap at 3 for brevity
+        parts.append(f"with {items_str}")
+
+    if product_title and len(product_title) <= 40:
+        parts.append(f"on {product_title}")
+
+    return " ".join(parts)
+
+
+def _build_doc_context_text(rag_context: dict) -> str:
+    """
+    Extract human-readable text from RAG-retrieved merchant documents.
+    Used to inject document data into LLM prompts.
+    """
+    context_parts = []
+    for doc in rag_context.get("merchant_docs", []):
+        text = doc.get("extracted_text", "")
+        if text:
+            sim = doc.get("similarity")
+            sim_str = f" (similarity: {sim:.3f})" if sim is not None else ""
+            context_parts.append(
+                f"[Merchant Doc: {doc.get('file_name', 'unknown')}{sim_str}]\n{text[:800]}"
+            )
+    return "\n\n".join(context_parts) if context_parts else "No document data available."
 
 
 def _fetch_pool_details(pool_id: str) -> dict:
@@ -83,22 +148,45 @@ def _fetch_merchant_details(merchant_id: str) -> dict:
     return rows[0]
 
 
-# ── Step 1 — Strategy Agent ─────────────────────────────────
+# ── Step 1 — Strategy Agent (now RAG-augmented) ─────────────
 
-def run_step1(merchant: dict, pool: dict) -> dict:
+def run_step1(merchant: dict, pool: dict) -> tuple[dict, dict]:
     """
     LLM call: Feasibility & Strategy assessment.
 
-    Returns structured strategy JSON.
+    Now includes lightweight RAG retrieval from merchant_documents only
+    (no archetypes/product_embeddings — Step 1 needs facts, not creative examples).
+
+    Returns (strategy_result, strategy_rag_context).
     """
     product = pool.get("_product", {})
 
+    # ── Retrieve merchant docs for this product ──────────────
+    strategy_rag = retrieve_context(
+        merchant_id=merchant["id"],
+        product_title=product.get("title", ""),
+        strategy_hint="",  # No strategy hint for Step 1
+        top_k=5,  # More chunks for Step 1 since we're looking for specific product data
+        sources=["merchant_docs"],  # Only merchant documents
+    )
+
+    doc_context_text = _build_doc_context_text(strategy_rag)
+
+    logger.info(
+        f"[{merchant.get('name')}] Step 1 RAG: "
+        f"{len(strategy_rag.get('merchant_docs', []))} doc chunks retrieved"
+    )
+
+    # ── Build prompt with both record data + document data ───
     user_content = json.dumps({
-        "merchant_name": merchant.get("name"),
-        "margin_floor_pct": merchant.get("margin_floor_pct"),
-        "stock_data": merchant.get("stock_data"),
-        "accessory_inventory": merchant.get("accessory_inventory"),
-        "warranty_cost_data": merchant.get("warranty_cost_data"),
+        "merchant_record": {
+            "merchant_name": merchant.get("name"),
+            "margin_floor_pct": merchant.get("margin_floor_pct"),
+            "stock_data": merchant.get("stock_data"),
+            "accessory_inventory": merchant.get("accessory_inventory"),
+            "warranty_cost_data": merchant.get("warranty_cost_data"),
+        },
+        "retrieved_document_data": doc_context_text,
         "product": {
             "title": product.get("title"),
             "price": float(product.get("price", 0)),
@@ -108,13 +196,16 @@ def run_step1(merchant: dict, pool: dict) -> dict:
 
     result = call_step1(STEP1_SYSTEM_PROMPT, user_content)
 
+    # Log raw response for debugging
+    logger.info(f"[{merchant.get('name')}] Raw Step 1 response keys: {list(result.keys())}")
+
     # Ensure required fields with defaults
     result.setdefault("max_discount_pct", 10)
     result.setdefault("preferred_lever", "discount")
     result.setdefault("reasoning", "")
     result.setdefault("risk_appetite", "moderate")
 
-    return result
+    return result, strategy_rag
 
 
 # ── Step 2 — Offer Composer (RAG-augmented) ──────────────────
@@ -127,7 +218,7 @@ def run_step2(merchant: dict, pool: dict, strategy: dict) -> tuple[dict, dict]:
     """
     product = pool.get("_product", {})
 
-    # Retrieve RAG context
+    # Retrieve RAG context (all sources for Step 2)
     rag_context = retrieve_context(
         merchant_id=merchant["id"],
         product_title=product.get("title", ""),
@@ -159,11 +250,25 @@ def run_step2(merchant: dict, pool: dict, strategy: dict) -> tuple[dict, dict]:
 
     result = call_step2(STEP2_SYSTEM_PROMPT, user_content)
 
+    # Log raw LLM response for debugging
+    logger.info(f"[{merchant.get('name')}] Raw Step 2 response keys: {list(result.keys())}")
+    logger.debug(f"[{merchant.get('name')}] Raw Step 2 response: {json.dumps(result, default=str)[:500]}")
+
     # Ensure required fields
     result.setdefault("offer_type", strategy.get("preferred_lever", "discount"))
     result.setdefault("price", float(product.get("price", 0)))
     result.setdefault("bundled_items", [])
     result.setdefault("description", "")
+
+    # Fallback: if LLM returned an empty or whitespace-only description
+    if not result["description"].strip():
+        result["description"] = _build_fallback_description(
+            offer_type=result["offer_type"],
+            price=float(result["price"]),
+            bundled_items=result.get("bundled_items"),
+            product_title=product.get("title", ""),
+        )
+        logger.warning(f"[{merchant.get('name')}] Used fallback description: {result['description']}")
 
     return result, rag_context
 
@@ -226,9 +331,10 @@ def run_single_merchant_pipeline(merchant: dict, pool: dict) -> dict:
     sb = get_supabase()
     merchant_id = str(merchant["id"])
     pool_id = str(pool["id"])
+    product = pool.get("_product", {})
 
-    # Step 1: Strategy
-    strategy = run_step1(merchant, pool)
+    # Step 1: Strategy (now returns RAG context too)
+    strategy, strategy_rag = run_step1(merchant, pool)
     logger.info(f"[{merchant['name']}] Step 1 done: {strategy.get('preferred_lever')}")
 
     # Step 2: Compose offer with RAG
@@ -239,6 +345,12 @@ def run_single_merchant_pipeline(merchant: dict, pool: dict) -> dict:
     status, reason, value_score = validate_offer(offer_data, strategy, merchant, pool)
     logger.info(f"[{merchant['name']}] Step 3: {status} ({reason}), score={value_score}")
 
+    # Combine RAG contexts for transparency
+    combined_rag = {
+        "strategy_rag_context": strategy_rag,
+        "composer_rag_context": rag_context,
+    }
+
     # Insert offer row
     offer_row = {
         "demand_pool_id": pool_id,
@@ -246,9 +358,14 @@ def run_single_merchant_pipeline(merchant: dict, pool: dict) -> dict:
         "offer_type": offer_data.get("offer_type", "discount"),
         "price": float(offer_data.get("price", 0)),
         "bundled_items": offer_data.get("bundled_items", []),
-        "description": offer_data.get("description", ""),
+        "description": offer_data.get("description") or _build_fallback_description(
+            offer_type=offer_data.get("offer_type", "discount"),
+            price=float(offer_data.get("price", 0)),
+            bundled_items=offer_data.get("bundled_items"),
+            product_title=product.get("title", ""),
+        ),
         "strategy_reasoning": strategy,
-        "rag_context_used": rag_context,
+        "rag_context_used": combined_rag,
         "value_score": value_score,
         "status": status,
     }

@@ -100,6 +100,63 @@ def check_abandoned_carts():
         logger.error(f"Abandonment check failed: {exc}")
 
 
+def retry_failed_shopify_orders():
+    sb = get_supabase()
+    rows = (
+        sb.table("orders")
+        .select("id")
+        .eq("status", "paid")
+        .eq("order_creation_failed", True)
+        .is_("shopify_order_id", "null")
+        .limit(20)
+        .execute()
+        .data
+    )
+    if not rows:
+        return
+
+    from app.services.shopify_orders import create_shopify_order
+
+    for row in rows:
+        try:
+            create_shopify_order(row["id"])
+        except Exception as exc:
+            logger.error(f"Retry Shopify order failed for {row['id']}: {exc}")
+
+
+def expire_unpaid_offers():
+    """
+    Periodic job: Find orders in 'pending_payment' status older than PAYMENT_EXPIRY_HOURS,
+    and mark them as 'expired'.
+    """
+    sb = get_supabase()
+    timeout_hours = getattr(settings, "PAYMENT_EXPIRY_HOURS", 8)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=timeout_hours)
+    cutoff_iso = cutoff.isoformat()
+
+    try:
+        stale_orders = (
+            sb.table("orders")
+            .select("id")
+            .eq("status", "pending_payment")
+            .lt("created_at", cutoff_iso)
+            .execute()
+            .data
+        )
+
+        if not stale_orders:
+            return
+
+        logger.info(f"Found {len(stale_orders)} expired unpaid orders")
+
+        for order in stale_orders:
+            sb.table("orders").update({"status": "expired"}).eq("id", order["id"]).execute()
+            sb.table("payments").update({"status": "failed"}).eq("order_id", order["id"]).execute()
+            
+    except Exception as exc:
+        logger.error(f"Expire unpaid offers check failed: {exc}")
+
+
 def start_scheduler():
     """Start the APScheduler background scheduler."""
     global _scheduler
@@ -113,6 +170,20 @@ def start_scheduler():
         "interval",
         minutes=1,  # Check every minute
         id="abandonment_checker",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        retry_failed_shopify_orders,
+        "interval",
+        minutes=1,
+        id="shopify_order_retry",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        expire_unpaid_offers,
+        "interval",
+        minutes=15,
+        id="expire_unpaid_offers",
         replace_existing=True,
     )
     _scheduler.start()
