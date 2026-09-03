@@ -9,9 +9,12 @@ Handles:
 - Creating merchant_products join rows
 """
 
+import logging
 from uuid import UUID
 from app.db.client import get_supabase
 from app.services import shopify as shopify_svc
+
+logger = logging.getLogger(__name__)
 
 
 def onboard_merchant(payload: dict) -> dict:
@@ -111,6 +114,43 @@ def link_products(merchant_id: UUID, assignments: list[dict]) -> dict:
                     sb.table("products").update(
                         {"product_group_id": str(group_id)}
                     ).eq("id", existing[0]["id"]).execute()
+
+            # ── 5. Reset stale pools & re-aggregate ─────────
+            if group_id:
+                affected = (
+                    sb.table("demand_pools")
+                    .select("id, product_group_id")
+                    .eq("product_group_id", str(group_id))
+                    .in_("status", ["open", "offers_generated"])
+                    .execute()
+                    .data
+                )
+                if affected:
+                    sb.table("demand_pools").update({
+                        "status": "open",
+                        "selected_merchant_ids": None
+                    }).eq("product_group_id", str(group_id)).in_(
+                        "status", ["open", "offers_generated"]
+                    ).execute()
+
+                    # Revert pooled signals back to abandoned so
+                    # re-aggregation can count them
+                    sb.table("demand_signals").update({
+                        "status": "abandoned"
+                    }).eq(
+                        "product_group_id", str(group_id)
+                    ).eq("status", "pooled").execute()
+
+                    # Re-run aggregation immediately so the new merchant
+                    # is included in selection without waiting for a new
+                    # cart abandonment signal.
+                    from app.services.aggregation import aggregate_demand_for_group
+                    for pool in affected:
+                        logger.info(
+                            f"Re-aggregating pool {pool['id']} after "
+                            f"new merchant linked to group {group_id}"
+                        )
+                        aggregate_demand_for_group(pool["product_group_id"])
 
             results["linked"].append({
                 "shopify_product_id": shopify_pid,

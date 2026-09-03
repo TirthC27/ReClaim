@@ -37,6 +37,8 @@ class Settings(BaseSettings):
 
     # Abandonment detection
     ABANDONMENT_TIMEOUT_MINUTES: int = 2  # 1-2 for demo, 10+ for production
+    MIN_CARTS_FOR_TRIGGER: int = 1        # demo default; raise for production bulk mode
+    POOL_WINDOW_HOURS: int = 24
 
     # Section 9A merchant selection — PLACEHOLDER VALUES pending final formula
     SMALL_POOL_THRESHOLD: int = 5       # pools below this → single best merchant

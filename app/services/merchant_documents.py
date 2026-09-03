@@ -85,21 +85,23 @@ def _chunk_csv(text: str, filename: str) -> list[dict]:
     Split a CSV file into logical section-based chunks.
 
     Returns a list of dicts, each with:
-      - chunk_name: human-readable label (e.g. "PRODUCT QUOTATION", "Row 3")
+      - chunk_name: human-readable label (e.g. "PRODUCT QUOTATION Row 13", etc.)
       - text: the text content of that chunk
 
     Strategy:
-    1. Try to detect section headers (PRODUCT QUOTATION, WARRANTY OPTIONS, etc.)
-    2. If sections are found, group rows under their section header
-    3. If no sections detected, fall back to row-by-row chunking
-       (grouping every 5 rows together to avoid too many tiny chunks)
+    1. Detect section boundaries by column 0 matching a known section name.
+       IMPORTANT: These CSVs use the section name as column 0 on EVERY data row,
+       not just a single header row. A row belongs to the current section if its
+       first cell matches the active section name — only a DIFFERENT section keyword
+       signals a real boundary change.
+    2. For PRODUCT QUOTATION: emit one chunk per product row (row_text = col header + data row)
+    3. For other sections: emit one chunk for the whole section.
+    4. Fallback: row-batch chunking if no sections detected.
     """
     lines = text.strip().split("\n")
     if len(lines) <= 2:
-        # Too small to chunk — return as single chunk
         return [{"chunk_name": filename, "text": text}]
 
-    # Try parsing with csv reader for better handling
     try:
         reader = csv.reader(io.StringIO(text))
         rows = list(reader)
@@ -110,20 +112,26 @@ def _chunk_csv(text: str, filename: str) -> list[dict]:
         return [{"chunk_name": filename, "text": text}]
 
     # ── Detect sections ──────────────────────────────────────
+    # Key fix: a row whose first cell = current section name is a DATA row, not a new boundary.
+    # Only switch section when a DIFFERENT known section name appears in column 0.
     sections: list[dict] = []
     current_section = {"name": "HEADER", "rows": []}
 
     for row in rows:
-        section_name = _is_section_header(row)
-        if section_name:
-            # Save previous section if it has content
+        detected = _is_section_header(row)
+        if detected and detected != current_section["name"]:
+            # Genuine section transition — save current and start new
             if current_section["rows"]:
                 sections.append(current_section)
-            current_section = {"name": section_name, "rows": []}
+            current_section = {"name": detected, "rows": []}
+            # The row itself is just the section label — don't append it as a data row
+        elif detected and detected == current_section["name"]:
+            # Same section name in col 0: this IS a data row, not a new boundary.
+            # Strip the leading section-name cell so the row contains only real data.
+            current_section["rows"].append(row[1:] if len(row) > 1 else row)
         else:
             current_section["rows"].append(row)
 
-    # Don't forget the last section
     if current_section["rows"]:
         sections.append(current_section)
 
@@ -131,17 +139,22 @@ def _chunk_csv(text: str, filename: str) -> list[dict]:
     named_sections = [s for s in sections if s["name"] != "HEADER"]
     if named_sections:
         chunks = []
+        # Extract the global column header from the HEADER section for use in PRODUCT QUOTATION chunks
+        header_section = next((s for s in sections if s["name"] == "HEADER"), None)
+        global_col_header = ",".join(header_section["rows"][0]) if header_section and header_section["rows"] else ""
+        # Strip the leading "Section" label cell from the column header (it's always col 0)
+        if global_col_header.startswith("Section,"):
+            global_col_header = global_col_header[len("Section,"):]
+
         for section in sections:
             if not section["rows"]:
                 continue
 
             # For PRODUCT QUOTATION, chunk each product row individually
-            # (first row in section is typically the column header)
-            if section["name"] == "PRODUCT QUOTATION" and len(section["rows"]) > 2:
-                # First row = column headers
-                col_header = ",".join(section["rows"][0])
-                for i, data_row in enumerate(section["rows"][1:], 1):
-                    row_text = f"[{section['name']} — Row {i}]\n{col_header}\n{','.join(data_row)}"
+            if section["name"] == "PRODUCT QUOTATION":
+                # All rows in this section are data rows (col 0 stripped), use global header
+                for i, data_row in enumerate(section["rows"], 1):
+                    row_text = f"[{section['name']} — Row {i}]\n{global_col_header}\n{','.join(data_row)}"
                     chunks.append({
                         "chunk_name": f"{filename} | {section['name']} Row {i}",
                         "text": row_text,
@@ -163,7 +176,7 @@ def _chunk_csv(text: str, filename: str) -> list[dict]:
     chunks = []
     header_row = ",".join(rows[0]) if rows else ""
     batch_size = 5
-    data_rows = rows[1:]  # Skip header
+    data_rows = rows[1:]
 
     for i in range(0, len(data_rows), batch_size):
         batch = data_rows[i:i + batch_size]
@@ -246,7 +259,87 @@ def upload_document(merchant_id: UUID, filename: str, file_bytes: bytes) -> dict
     logger.info(f"Document '{filename}' uploaded: {len(inserted_rows)} chunk(s) created")
 
     # Return first row for backward compatibility with the API response
-    return inserted_rows[0]
+    result_doc = inserted_rows[0]
+    
+    if ext == ".csv" and extracted_text:
+        try:
+            auto_group_from_quotation(merchant_id, extracted_text)
+        except Exception as exc:
+            logger.error(f"Failed to auto-group from quotation: {exc}")
+            
+    return result_doc
+
+
+def auto_group_from_quotation(merchant_id: UUID, extracted_text: str):
+    """
+    Parse the CSV text, detect PRODUCT QUOTATION rows,
+    and automatically create product_groups and merchant_products.
+    """
+    sb = get_supabase()
+    
+    # 1. Fetch the merchant's vendor name to strip it from products
+    merchant = sb.table("merchants").select("shopify_vendor_name, name").eq("id", str(merchant_id)).single().execute().data
+    vendor_name = merchant.get("shopify_vendor_name") or merchant.get("name") or ""
+    vendor_prefix = vendor_name.split()[0] if vendor_name else ""
+    
+    # Fetch real Shopify products to map to real IDs instead of demo IDs
+    from app.services.shopify import fetch_products_by_vendor
+    real_shopify_products = []
+    if vendor_name:
+        try:
+            real_shopify_products = fetch_products_by_vendor(vendor_name)
+        except Exception as exc:
+            logger.warning(f"Failed to fetch Shopify products for {vendor_name}: {exc}")
+            
+    # Build a lookup dictionary: sku -> shopify_product_id (string)
+    sku_to_shopify_id = {}
+    for p in real_shopify_products:
+        p_id = str(p.get("id"))
+        for variant in p.get("variants", []):
+            if variant.get("sku"):
+                sku_to_shopify_id[variant["sku"]] = p_id
+                
+    reader = csv.DictReader(io.StringIO(extracted_text))
+    for row in reader:
+        # Check if the row belongs to PRODUCT QUOTATION
+        # Depending on how the CSV is structured, it might be in 'Section' column or the first column
+        if row.get("Section") != "PRODUCT QUOTATION" and list(row.values())[0] != "PRODUCT QUOTATION":
+            continue
+            
+        category = row.get("Category", "General")
+        raw_product_name = row.get("Product", row.get("Product Name", ""))
+        sku = row.get("SKU", "")
+        
+        if not raw_product_name or not sku:
+            continue
+            
+        # Strip merchant name prefix to get generic model name
+        model_name = raw_product_name
+        if vendor_prefix and model_name.startswith(vendor_prefix):
+            model_name = model_name[len(vendor_prefix):].strip()
+            
+        # 1. Upsert product_group (match by model_name or create)
+        existing_group = sb.table("product_groups").select("id").eq("model_name", model_name).execute().data
+        if existing_group:
+            group_id = existing_group[0]["id"]
+        else:
+            new_group = sb.table("product_groups").insert({
+                "model_name": model_name,
+                "canonical_sku": f"canonical-{sku}",
+                "category": category
+            }).execute().data[0]
+            group_id = new_group["id"]
+            
+        # 2. Add to merchant_products map
+        # Use the real Shopify Product ID if found, otherwise fallback to a demo ID
+        shopify_product_id = sku_to_shopify_id.get(sku, f"demo_shp_{sku}")
+        
+        # Upsert mapping
+        sb.table("merchant_products").upsert({
+            "merchant_id": str(merchant_id),
+            "shopify_product_id": shopify_product_id,
+            "product_group_id": group_id
+        }, on_conflict="merchant_id,shopify_product_id").execute()
 
 
 def list_documents(merchant_id: UUID) -> list[dict]:

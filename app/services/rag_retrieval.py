@@ -17,6 +17,7 @@ Supports a `sources` filter to limit retrieval to specific sources
 import logging
 from app.db.client import get_supabase
 from app.services.embeddings import generate_embedding
+from app.services.shopify_inventory import resolve_inventory_item_id
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +25,42 @@ logger = logging.getLogger(__name__)
 ALL_SOURCES = {"merchant_docs", "product_context", "archetypes"}
 
 
+def resolve_merchant_sku(
+    merchant_id: str, product_group_id: str, product_title: str = ""
+) -> str | None:
+    """Resolve the Shopify SKU belonging to this merchant's group mapping."""
+    sb = get_supabase()
+    mappings = (sb.table("merchant_products").select("shopify_product_id")
+                .eq("merchant_id", str(merchant_id))
+                .eq("product_group_id", str(product_group_id))
+                .execute().data or [])
+    if not mappings:
+        return None
+
+    title_tokens = set((product_title or "").lower().split())
+    candidates = []
+    for mapping in mappings:
+        shopify_id = mapping.get("shopify_product_id")
+        if not shopify_id:
+            continue
+        product = (sb.table("products").select("sku,title")
+                   .eq("shopify_product_id", str(shopify_id))
+                   .limit(1).execute().data)
+        info = product[0] if product else None
+        if not info or not info.get("sku"):
+            info = resolve_inventory_item_id(str(shopify_id))
+        if not info or not info.get("sku"):
+            continue
+        score = len(title_tokens & set((info.get("title") or "").lower().split()))
+        candidates.append((score, str(info["sku"])))
+
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
 def retrieve_context(
     merchant_id: str,
     product_title: str,
+    product_sku: str = "",
     strategy_hint: str = "",
     top_k: int = 3,
     sources: list[str] | None = None,
@@ -42,7 +76,8 @@ def retrieve_context(
 
     Returns a combined context object with text + similarity scores.
     """
-    query_text = f"{product_title}. Strategy: {strategy_hint}" if strategy_hint else product_title
+    base_query = f"{product_title} {product_sku} pricing stock margin".strip()
+    query_text = f"{base_query}. Strategy: {strategy_hint}" if strategy_hint else base_query
     active_sources = set(sources) if sources else ALL_SOURCES
 
     try:
@@ -60,6 +95,9 @@ def retrieve_context(
     if "merchant_docs" in active_sources:
         merchant_docs = _rpc_match_merchant_documents(
             sb, query_embedding, str(merchant_id), top_k
+        )
+        merchant_docs = _prioritize_product_documents(
+            sb, merchant_docs, str(merchant_id), product_sku, product_title, top_k
         )
         logger.info(
             f"[RAG] merchant_documents: {len(merchant_docs)} rows returned"
@@ -96,6 +134,38 @@ def retrieve_context(
         result["archetypes"] = []
 
     return result
+
+
+def _prioritize_product_documents(
+    sb, documents: list[dict], merchant_id: str, product_sku: str,
+    product_title: str, top_k: int
+) -> list[dict]:
+    """Put this merchant's exact SKU row ahead of neighboring catalog rows."""
+    if not product_sku:
+        return documents
+    exact = [d for d in documents if product_sku in (d.get("extracted_text") or "")]
+    try:
+        query = (sb.table("merchant_documents")
+                .select("id,file_name,extracted_text")
+                .eq("merchant_id", merchant_id)
+                .ilike("extracted_text", f"%{product_sku}%"))
+        rows = query.limit(top_k).execute().data or []
+        if not rows and product_title:
+            # Uploaded merchant CSVs can use a merchant-branded title/SKU
+            # (e.g. GAD-008) while Shopify uses the canonical vendor SKU.
+            title_words = product_title.split()
+            product_phrase = " ".join(title_words[-2:]) if len(title_words) > 1 else product_title
+            rows = (sb.table("merchant_documents").select("id,file_name,extracted_text")
+                    .eq("merchant_id", merchant_id)
+                    .ilike("extracted_text", f"%{product_phrase}%")
+                    .limit(top_k).execute().data or [])
+        existing = {d.get("id") for d in exact}
+        exact.extend({**row, "similarity": None} for row in rows if row.get("id") not in existing)
+    except Exception as exc:
+        logger.warning("Exact SKU document lookup failed for %s/%s: %s", merchant_id, product_sku, exc)
+    exact_ids = {d.get("id") for d in exact}
+    supplemental = [d for d in documents if d.get("id") not in exact_ids]
+    return (exact + supplemental)[:top_k]
 
 
 def _rpc_match_merchant_documents(

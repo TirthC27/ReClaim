@@ -154,6 +154,9 @@ class DemandPoolCreate(BaseModel):
     signal_count: int = 0
     status: str = "open"
     threshold: int = 1
+    window_start: datetime | None = None
+    expires_at: datetime | None = None
+    min_carts_required: int = 1
 
 
 class DemandPoolRead(_TimestampMixin):
@@ -164,6 +167,9 @@ class DemandPoolRead(_TimestampMixin):
     threshold: int
     selected_merchant_ids: list[str] | None = None
     updated_at: datetime | None = None
+    window_start: datetime | None = None
+    expires_at: datetime | None = None
+    min_carts_required: int = 1
 
 
 # ── merchant_documents ───────────────────────────────────────
