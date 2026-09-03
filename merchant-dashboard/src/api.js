@@ -2,7 +2,7 @@
  * API client for the Project Flow backend.
  */
 
-const API_BASE =
+export const API_BASE =
   import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 async function request(path, options = {}) {
@@ -77,9 +77,12 @@ export const fetchDemandPools = () => request("/demand-pools");
 
 export const fetchAllocations = (poolId) => request(`/demand-pools/${poolId}/allocations`);
 
-export const fetchOffers = (poolId, status) => {
+export const fetchPoolSignals = (poolId) => request(`/demand-pools/${poolId}/signals`);
+
+export const fetchOffers = (poolId, status, statusNe) => {
   const qs = new URLSearchParams({ pool_id: poolId });
   if (status) qs.set("status", status);
+  if (statusNe) qs.set("status_ne", statusNe);
   return request(`/offers?${qs.toString()}`);
 };
 
@@ -91,7 +94,30 @@ export const selectOffer = (offerId, demandSignalId) =>
 
 export const fetchOrder = (orderId) => request(`/orders/${orderId}`);
 
-export const generateOffers = (poolId) =>
-  request(`/demand-pools/${poolId}/generate-offers`, {
+export const generateOffers = async (poolId) => {
+  const response = await fetch(`${API_BASE}/demand-pools/${poolId}/generate-offers`, {
     method: "POST",
   });
+  if (!response.ok) {
+    throw new Error("Failed to generate offers");
+  }
+  return response.json();
+};
+
+export const negotiatePool = async (poolId) => {
+  const response = await fetch(`${API_BASE}/demand-pools/${poolId}/negotiate`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error("Failed to run negotiation");
+  }
+  return response.json();
+};
+
+export const fetchNegotiationRounds = async (poolId) => {
+  const response = await fetch(`${API_BASE}/demand-pools/${poolId}/negotiation-rounds`);
+  if (!response.ok) {
+    throw new Error("Failed to fetch negotiation rounds");
+  }
+  return response.json();
+};

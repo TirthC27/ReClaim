@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { fetchDemandPools, generateOffers } from "../api";
+import { fetchDemandPools, generateOffers, API_BASE } from "../api";
 import { supabase } from "../supabaseClient";
 import { useDemoSession } from "../contexts/DemoSessionContext";
 
@@ -10,6 +10,47 @@ export default function DemandDashboard() {
   const [generating, setGenerating] = useState(null);
   const navigate = useNavigate();
   const { setPoolId, setDemandSignalId } = useDemoSession();
+
+  const [showBulkSim, setShowBulkSim] = useState(false);
+  const [bulkProductId, setBulkProductId] = useState("");
+  const [bulkCount, setBulkCount] = useState(20);
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [bulkResult, setBulkResult] = useState(null);
+  const [products, setProducts] = useState([]);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/products?limit=100`)
+      .then(r => r.json())
+      .then(setProducts);
+  }, []);
+
+  const handleSimulateBulk = async () => {
+    if (!bulkProductId) return;
+    setBulkLoading(true);
+    setBulkResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/demo/simulate-bulk-demand`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ product_id: bulkProductId, customer_count: Number(bulkCount) }),
+      });
+      const data = await res.json();
+      setBulkResult(data);
+      load(); // refresh the pool list so the new/updated pool shows immediately
+    } catch (e) {
+      setBulkResult({ error: e.message || "Failed to simulate demand" });
+    } finally {
+      setBulkLoading(false);
+    }
+  };
+
+  const handleCleanupDemoData = async () => {
+    if (!window.confirm("Delete all synthetic demo carts/signals? This cannot be undone.")) return;
+    const res = await fetch(`${API_BASE}/demo/cleanup-bulk-demand`, { method: "DELETE" });
+    const data = await res.json();
+    alert(`Cleaned up ${data.deleted_count} demo carts`);
+    load();
+  };
 
   const load = async () => {
     try {
@@ -68,6 +109,51 @@ export default function DemandDashboard() {
         Live updates when Supabase Realtime is enabled for demand_pools.
       </p>
 
+      <div style={{ border: "1px dashed #888", borderRadius: 12, padding: 16, marginBottom: 20 }}>
+        <button onClick={() => setShowBulkSim(!showBulkSim)} style={{ fontWeight: 600 }}>
+          🧪 Simulate Bulk Demand (Demo)
+        </button>
+        <button onClick={handleCleanupDemoData} style={{ color: "crimson", marginLeft: 12 }}>
+          🧹 Clean Up Demo Data
+        </button>
+
+        {showBulkSim && (
+          <div style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <select value={bulkProductId} onChange={(e) => setBulkProductId(e.target.value)}>
+              <option value="">Select a product...</option>
+              {products.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.title} — ₹{p.price}
+                </option>
+              ))}
+            </select>
+
+            <input
+              type="number"
+              min="1"
+              max="200"
+              value={bulkCount}
+              onChange={(e) => setBulkCount(e.target.value)}
+              style={{ width: 80 }}
+            />
+            <span>customers</span>
+
+            <button onClick={handleSimulateBulk} disabled={bulkLoading || !bulkProductId}>
+              {bulkLoading ? "Simulating..." : "Run Simulation"}
+            </button>
+
+            {bulkResult && !bulkResult.error && (
+              <span style={{ color: "lightgreen" }}>
+                ✅ Created {bulkResult.created_signals} signals for pool
+              </span>
+            )}
+            {bulkResult?.error && (
+              <span style={{ color: "crimson" }}>❌ {bulkResult.error}</span>
+            )}
+          </div>
+        )}
+      </div>
+
       {error && <div style={{ color: "crimson" }}>{error}</div>}
 
       <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
@@ -84,8 +170,11 @@ export default function DemandDashboard() {
             }}
           >
             <div>
-              <div style={{ fontWeight: 600 }}>
-                Pool {String(p.id).slice(0, 8)}
+              <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: "8px" }}>
+                {p.product_groups?.model_name || `Pool ${String(p.id).slice(0, 8)}`}
+                {p.signals?.length > 0 && p.signals.every(s => s.customer_email?.startsWith("demo.")) && (
+                  <span style={{ background: "#553", color: "#fff", padding: "2px 8px", borderRadius: 4, fontSize: 11 }}>DEMO POOL</span>
+                )}
               </div>
               <div style={{ fontSize: 14, opacity: 0.8 }}>
                 signals: {p.signal_count} · status: {p.status}
