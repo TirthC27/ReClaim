@@ -8,12 +8,52 @@ selects which merchants should generate offers.
 
 import math
 import logging
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from app.config import settings
 from app.db.client import get_supabase
 
 logger = logging.getLogger(__name__)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def is_pool_eligible_for_agents(pool: dict) -> bool:
+    expires_at = pool.get("expires_at")
+    if not expires_at:
+        return False
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) <= expires_at and int(pool.get(
+        "signal_count", 0
+    )) >= int(pool.get("min_carts_required", 1))
+
+
+def pool_eligibility_message(pool: dict) -> str:
+    expires_at = pool.get("expires_at") or "unknown"
+    return (
+        f"Pool not yet eligible: needs {pool.get('min_carts_required', 1)} carts, "
+        f"has {pool.get('signal_count', 0)}, window closes {expires_at}"
+    )
+
+
+def archive_expired_pools() -> int:
+    sb = get_supabase()
+    expired = (sb.table("demand_pools").select("id")
+               .lt("expires_at", now_iso()).neq("status", "expired")
+               .execute().data or [])
+    for pool in expired:
+        sb.table("demand_pools").update({
+            "status": "expired", "updated_at": now_iso()
+        }).eq("id", pool["id"]).execute()
+    if expired:
+        logger.info("Archived %s expired demand pools", len(expired))
+    return len(expired)
 
 
 def aggregate_demand_for_group(product_group_id: str) -> dict | None:
@@ -48,6 +88,7 @@ def aggregate_demand_for_group(product_group_id: str) -> dict | None:
         .select("*")
         .eq("product_group_id", group_id)
         .in_("status", ["open", "offers_generated"])
+        .gt("expires_at", now_iso())
         .limit(1)
         .execute()
         .data
@@ -66,6 +107,11 @@ def aggregate_demand_for_group(product_group_id: str) -> dict | None:
             "signal_count": signal_count,
             "status": "open",
             "threshold": 1,
+            "window_start": now_iso(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(
+                hours=settings.POOL_WINDOW_HOURS
+            )).isoformat(),
+            "min_carts_required": settings.MIN_CARTS_FOR_TRIGGER,
         }).execute().data
         pool_id = result[0]["id"]
 
@@ -79,7 +125,7 @@ def aggregate_demand_for_group(product_group_id: str) -> dict | None:
         .data[0]
     )
 
-    threshold = pool.get("threshold", 1)
+    threshold = pool.get("min_carts_required", pool.get("threshold", 1))
 
     if signal_count >= threshold:
         # ── 4. Section 9A merchant selection ──────────────────
@@ -94,6 +140,7 @@ def aggregate_demand_for_group(product_group_id: str) -> dict | None:
         # Mark signals as pooled
         sb.table("demand_signals").update({
             "status": "pooled",
+            "demand_pool_id": str(pool_id),
         }).eq("product_group_id", group_id).eq("status", "abandoned").execute()
 
         logger.info(
@@ -166,10 +213,12 @@ def _select_merchants_9a(product_group_id: str, signal_count: int) -> list[str]:
         best = _pick_best_merchant(active_merchants)
         return [str(best["id"])]
     else:
-        # Larger pool: proportional selection
+        # Larger pool: proportional selection with a floor of 2
+        # max(2, ...) ensures real competition whenever 2+ merchants are eligible,
+        # while still scaling up properly for bulk pools (e.g. 25 signals → 5)
         num_to_select = min(
             len(active_merchants),
-            math.ceil(signal_count / demand_per_merchant),
+            max(2, math.ceil(signal_count / demand_per_merchant)),
         )
         # Sort by margin headroom (lowest floor = most room to offer)
         sorted_merchants = sorted(

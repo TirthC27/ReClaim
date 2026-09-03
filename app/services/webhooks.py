@@ -149,7 +149,8 @@ def process_checkout_create(payload: dict) -> dict:
     """
     sb = get_supabase()
 
-    checkout_id = str(payload.get("id", ""))
+    checkout_id = str(payload.get("id", "") or payload.get("token", ""))
+    cart_token = str(payload.get("cart_token", "") or payload.get("token", ""))
     customer_email = None
     if payload.get("email"):
         customer_email = payload["email"]
@@ -162,6 +163,8 @@ def process_checkout_create(payload: dict) -> dict:
         "customer_email": customer_email,
         "status": "active",
     }
+    if cart_token:
+        cart_row["cart_token"] = cart_token
     cart_result = (
         sb.table("carts")
         .upsert(cart_row, on_conflict="shopify_checkout_id")
@@ -213,23 +216,47 @@ def process_checkout_create(payload: dict) -> dict:
         product_group_id = _resolve_product_group_id(shopify_pid)
         merchant_id = _resolve_merchant_id(shopify_pid)
 
-        # Insert demand signal
-        signal = {
-            "cart_id": str(cart_id),
-            "product_id": str(internal_product_id),
-            "quantity": int(item.get("quantity", 1)),
-            "status": "pending",
-        }
-        if product_group_id:
-            signal["product_group_id"] = str(product_group_id)
-        if merchant_id:
-            signal["merchant_id"] = str(merchant_id)
+        # Upsert demand signal — deduplicate by cart_id + product_id
+        existing_signal = (
+            sb.table("demand_signals")
+            .select("id")
+            .eq("cart_id", str(cart_id))
+            .eq("product_id", str(internal_product_id))
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+            .data
+        )
 
-        try:
-            sb.table("demand_signals").insert(signal).execute()
-            signals_created += 1
-        except Exception as exc:
-            logger.error(f"Failed to create demand signal: {exc}")
+        if existing_signal:
+            # Update quantity on existing signal instead of creating duplicate
+            try:
+                sb.table("demand_signals").update({
+                    "quantity": int(item.get("quantity", 1)),
+                    "product_title": item.get("title", "Unknown"),
+                }).eq("id", existing_signal[0]["id"]).execute()
+                signals_created += 1
+            except Exception as exc:
+                logger.error(f"Failed to update demand signal: {exc}")
+        else:
+            # Create new signal
+            signal = {
+                "cart_id": str(cart_id),
+                "product_id": str(internal_product_id),
+                "product_title": item.get("title", "Unknown"),
+                "quantity": int(item.get("quantity", 1)),
+                "status": "pending",
+            }
+            if product_group_id:
+                signal["product_group_id"] = str(product_group_id)
+            if merchant_id:
+                signal["merchant_id"] = str(merchant_id)
+
+            try:
+                sb.table("demand_signals").insert(signal).execute()
+                signals_created += 1
+            except Exception as exc:
+                logger.error(f"Failed to create demand signal: {exc}")
 
     return {
         "cart_id": str(cart_id),

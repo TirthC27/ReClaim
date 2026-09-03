@@ -13,7 +13,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.config import settings
 from app.db.client import get_supabase
-from app.services.aggregation import aggregate_demand_for_group
+from app.services.aggregation import aggregate_demand_for_group, archive_expired_pools
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,10 @@ def check_abandoned_carts():
 
         for cart in stale_carts:
             cart_id = cart["id"]
+            
+            # Fetch the customer email from the cart to pass to the recovery
+            cart_details = sb.table("carts").select("customer_email").eq("id", str(cart_id)).execute().data
+            customer_email = cart_details[0].get("customer_email") if cart_details else None
 
             # ── Mark cart as abandoned ────────────────────────
             sb.table("carts").update({
@@ -81,6 +85,44 @@ def check_abandoned_carts():
 
                 if signal.get("product_group_id"):
                     affected_groups.add(signal["product_group_id"])
+
+            # ── Create cart_recoveries record ───────────────
+            if signals:
+                existing_recovery = (sb.table("cart_recoveries").select("id")
+                    .eq("cart_id", str(cart_id)).order("created_at", desc=True)
+                    .limit(1).execute().data)
+                if existing_recovery:
+                    recovery_id = existing_recovery[0]["id"]
+                    sb.table("cart_recoveries").update({
+                        "customer_email": customer_email,
+                    }).eq("id", recovery_id).execute()
+                    rec_result = [{"id": recovery_id}]
+                    logger.info("Reusing cart_recovery %s for cart %s", recovery_id, cart_id)
+                else:
+                    recovery = {
+                        "cart_id": str(cart_id),
+                        "customer_email": customer_email,
+                        "status": "awaiting_offers",
+                        "expires_at": (datetime.now(timezone.utc) + timedelta(
+                            hours=settings.POOL_WINDOW_HOURS
+                        )).isoformat(),
+                    }
+                    rec_result = sb.table("cart_recoveries").insert(recovery).execute().data
+                if rec_result:
+                    recovery_id = rec_result[0]["id"]
+                    # Insert items
+                    linked = (sb.table("cart_recovery_items").select("demand_signal_id")
+                              .eq("cart_recovery_id", recovery_id).execute().data)
+                    linked_ids = {row["demand_signal_id"] for row in linked}
+                    recovery_items = []
+                    for sig in signals:
+                        if sig["id"] not in linked_ids:
+                            recovery_items.append({
+                                "cart_recovery_id": recovery_id,
+                                "demand_signal_id": sig["id"]
+                            })
+                    if recovery_items:
+                        sb.table("cart_recovery_items").insert(recovery_items).execute()
 
             logger.info(
                 f"Cart {cart_id} abandoned: "
@@ -184,6 +226,13 @@ def start_scheduler():
         "interval",
         minutes=15,
         id="expire_unpaid_offers",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        archive_expired_pools,
+        "interval",
+        minutes=15,
+        id="archive_expired_pools",
         replace_existing=True,
     )
     _scheduler.start()

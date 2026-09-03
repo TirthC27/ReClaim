@@ -1,4 +1,4 @@
-"""Health-check endpoint."""
+"""Health-check endpoint."""  # reload-trigger
 
 from fastapi import APIRouter
 

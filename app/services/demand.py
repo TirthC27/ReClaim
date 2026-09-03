@@ -1,6 +1,7 @@
 """CRUD helpers for **demand_signals** and **demand_pools**."""
 
 from uuid import UUID
+from app.services.aggregation import now_iso
 from app.db.client import get_supabase
 
 
@@ -12,14 +13,47 @@ JOIN_TABLE = "merchant_products"
 # ── demand_pools ─────────────────────────────────────────────
 
 def list_demand_pools(limit: int = 100, offset: int = 0) -> list[dict]:
-    return (
-        get_supabase()
-        .table(POOLS)
-        .select("*")
+    sb = get_supabase()
+    pools = (
+        sb.table(POOLS)
+        .select("*, product_groups(model_name)")
+        .gt("expires_at", now_iso())
+        .order("created_at", desc=True)
         .range(offset, offset + limit - 1)
         .execute()
         .data
     )
+    if not pools:
+        return []
+
+    # Fetch signals for all pools to determine demo status on frontend
+    group_ids = [p["product_group_id"] for p in pools if p.get("product_group_id")]
+    if group_ids:
+        signals_data = (
+            sb.table(SIGNALS)
+            .select("product_group_id, carts(customer_email)")
+            .in_("product_group_id", group_ids)
+            .execute()
+            .data
+        )
+        
+        # Group signals by product_group_id
+        signals_by_group = {}
+        for s in signals_data:
+            gid = s["product_group_id"]
+            if gid not in signals_by_group:
+                signals_by_group[gid] = []
+            
+            customer_email = None
+            if s.get("carts") and s["carts"].get("customer_email"):
+                customer_email = s["carts"]["customer_email"]
+                
+            signals_by_group[gid].append({"customer_email": customer_email})
+            
+        for p in pools:
+            p["signals"] = signals_by_group.get(p["product_group_id"], [])
+
+    return pools
 
 
 def get_demand_pool(pool_id: UUID) -> dict | None:

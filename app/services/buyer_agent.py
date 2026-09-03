@@ -12,6 +12,7 @@ from uuid import UUID
 
 from app.db.client import get_supabase
 from app.services.llm_client import call_with_fallback
+from app.services.shopify_inventory import get_stock_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +36,45 @@ matching this exact schema:
     {"offer_id": "<uuid>", "merchant_id": "<uuid>", "units": <int>}
   ]
 }
+
+IMPORTANT: A warranty, service, or bundle offer with NO price discount is only worth
+more than a plain discount offer if its added value can be reasonably quantified from
+the data provided. If a merchant's own reasoning states their cost, stock, or warranty
+data is missing, treat their non-price claim as unverified and worth zero extra — do
+not rank it above a competitor's real, guaranteed price discount. When in doubt, prefer
+the offer with the largest verified discount.
 """
+
+def _compute_effective_value(offer: dict) -> float:
+    """
+    Effective value = guaranteed savings vs list price, ignoring vague
+    non-price claims (warranty/service) when the merchant's own
+    strategy_reasoning shows missing cost/stock/warranty data —
+    an unquantified benefit is worth 0 extra, not a tiebreaker win.
+    """
+    list_price = offer.get("list_price") or offer["price"]  # fetch actual list price for comparison
+    guaranteed_discount = max(0, list_price - offer["price"])
+
+    reasoning = offer.get("strategy_reasoning") or {}
+    data_gaps = (
+        reasoning.get("data_completeness") or reasoning.get("data_availability") or {}
+    )
+    has_real_data = not any(v == "missing" for v in data_gaps.values()) if data_gaps else True
+
+    if offer["offer_type"] in ("warranty", "service") and offer["price"] >= list_price and not has_real_data:
+        # No real discount AND no verified cost basis for the "free" warranty/service claim
+        # → treat its added value as zero, not a premium offer
+        return guaranteed_discount  # effectively just the discount amount (0 here)
+
+    return guaranteed_discount  # extend later to add verified bundle/warranty value once real cost data exists
+
 
 
 def _fetch_validated_offers(pool_id: str) -> list[dict]:
     supabase = get_supabase()
     resp = (
         supabase.table("offers")
-        .select("id,merchant_id,offer_type,price,bundled_items,description,value_score")
+        .select("id,merchant_id,offer_type,price,bundled_items,description,value_score,strategy_reasoning")
         .eq("demand_pool_id", pool_id)
         .eq("status", "validated")
         .execute()
@@ -50,20 +82,13 @@ def _fetch_validated_offers(pool_id: str) -> list[dict]:
     return resp.data or []
 
 
-def _fetch_merchant_stock(merchant_id: str, product_id: str) -> int:
-    supabase = get_supabase()
-    resp = (
-        supabase.table("merchants")
-        .select("stock_data")
-        .eq("id", merchant_id)
-        .single()
-        .execute()
+def _fetch_merchant_stock(merchant_id: str, sku: str) -> int:
+    qty, source = get_stock_with_fallback(merchant_id, sku)
+    logger.info(
+        "[buyer_agent] Stock resolved merchant=%s sku=%s qty=%s source=%s",
+        merchant_id, sku, qty, source,
     )
-    stock_data = (resp.data or {}).get("stock_data") or {}
-    # stock_data may be keyed by product_id or be a flat {"available_qty": N} — handle both
-    if product_id in stock_data:
-        return int(stock_data[product_id].get("qty", 0)) if isinstance(stock_data[product_id], dict) else int(stock_data[product_id])
-    return int(stock_data.get("available_qty", 0))
+    return qty
 
 
 def _build_user_content(offers: list[dict], total_demand_qty: int, merchant_stock: dict[str, int]) -> str:
@@ -116,8 +141,20 @@ def run_buyer_agent(pool_id: str, product_id: str, total_demand_qty: int) -> dic
         logger.warning(f"[buyer_agent] No validated offers for pool {pool_id}, skipping")
         return {"ranking": [], "allocation_plan": []}
 
+    # Attach list price for effective value calculation
+    product_resp = supabase.table("products").select("price,sku").eq("id", product_id).execute()
+    if not product_resp.data:
+        raise ValueError(f"No product found for product_id={product_id} — check caller is passing a real product ID, not a product_group_id")
+    list_price = float(product_resp.data[0]["price"]) if product_resp.data[0].get("price") else 0.0
+    product_sku = product_resp.data[0].get("sku") or ""
+    for o in offers:
+        o["list_price"] = list_price
+
+    # Pre-rank by effective value descending
+    offers.sort(key=_compute_effective_value, reverse=True)
+
     merchant_stock = {
-        o["merchant_id"]: _fetch_merchant_stock(o["merchant_id"], product_id)
+        o["merchant_id"]: _fetch_merchant_stock(o["merchant_id"], product_sku)
         for o in offers
     }
 

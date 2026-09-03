@@ -15,8 +15,9 @@ from uuid import UUID
 from app.config import settings
 from app.db.client import get_supabase
 from app.services.llm_client import call_step1, call_step2, LLMError
-from app.services.rag_retrieval import retrieve_context
+from app.services.rag_retrieval import retrieve_context, resolve_merchant_sku
 from app.services.aggregation import get_selected_merchants
+from app.services.shopify_inventory import get_stock_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +33,26 @@ Your job: determine the merchant's strategic leaning — how much price flexibil
 exists, which non-price levers (gifts/bundles/warranty) are most economically \
 sensible, and overall risk appetite for this opportunity.
 
-IMPORTANT: Use the retrieved document data as your PRIMARY source for stock, cost, \
-and margin information. The merchant record fields may be null even when the data \
-IS available in the retrieved documents. Only mark a field as "missing" if it truly \
-isn't present in EITHER the merchant record OR the retrieved documents.
+IMPORTANT: live_shopify_stock_qty is the authoritative stock quantity for this exact \ 
+product and merchant. Never override it with stock_data or a document-derived number. \ 
+Use retrieved document data only for qualitative reasoning about cost, margin, bundles, \ 
+and warranty. The merchant record fields may be null even when the data is available in \ 
+the retrieved documents. Only mark a non-stock field as "missing" if it truly isn't \ 
+present in EITHER the merchant record OR the retrieved documents.
 
 Do NOT propose a final offer yet — output only a structured strategy assessment.
-Respond in valid JSON only."""
+Respond in valid JSON only.
+
+If you lack cost, stock, or warranty data, your default recommended lever should be a
+small, conservative real discount within margin_floor_pct — not a "hold at list price"
+warranty/service claim you cannot economically justify. An unverifiable non-price claim
+provides no real customer value and should not be your fallback strategy.
+
+CRITICAL: The product you are generating an offer for is specified in the "product" 
+field above. Any stock, accessory, or warranty data shown belongs ONLY to that exact 
+product/SKU — ignore any retrieved document content that describes a different 
+product. Never reference or price a product other than the one named in "product.title".
+"""
 
 STEP2_SYSTEM_PROMPT = """\
 You are a merchant agent composing a customer-facing offer. You have this merchant's \
@@ -53,7 +67,13 @@ Respond with a JSON object containing EXACTLY these keys:
 e.g. "Best Price: ₹26,990 + Free Wireless Mouse" or "Protection Deal: ₹28,500 with 2-Year Extended Warranty"
 
 The description MUST be non-empty and should highlight the key value proposition.
-Respond in valid JSON only."""
+Respond in valid JSON only.
+
+CRITICAL: The product you are generating an offer for is specified in the "product" 
+field above. Any stock, accessory, or warranty data shown belongs ONLY to that exact 
+product/SKU — ignore any retrieved document content that describes a different 
+product. Never reference or price a product other than the one named in "product.title".
+"""
 
 # Marketplace display categories (Section 12)
 OFFER_CATEGORIES = {
@@ -139,6 +159,26 @@ def _fetch_pool_details(pool_id: str) -> dict:
     return pool
 
 
+def _filter_merchant_data_to_product(merchant: dict, product_sku: str) -> dict:
+    """
+    Merchant's stock_data/accessory_inventory/warranty_cost_data may be
+    keyed by SKU (e.g. {"DIG-021": {...}, "DIG-013": {...}}) or be a flat
+    catalog-wide structure. Extract only what's relevant to this product.
+    """
+    def extract(field: dict | None) -> dict | None:
+        if not field:
+            return None
+        if product_sku in field:
+            return {product_sku: field[product_sku]}
+        return None  # don't pass unrelated SKUs' data at all
+
+    return {
+        "stock_data": extract(merchant.get("stock_data")),
+        "accessory_inventory": extract(merchant.get("accessory_inventory")),
+        "warranty_cost_data": extract(merchant.get("warranty_cost_data")),
+    }
+
+
 def _fetch_merchant_details(merchant_id: str) -> dict:
     """Fetch full merchant record."""
     sb = get_supabase()
@@ -160,11 +200,15 @@ def run_step1(merchant: dict, pool: dict) -> tuple[dict, dict]:
     Returns (strategy_result, strategy_rag_context).
     """
     product = pool.get("_product", {})
+    merchant_sku = resolve_merchant_sku(
+        merchant["id"], pool["product_group_id"], product.get("title", "")
+    ) or product.get("sku", "")
 
     # ── Retrieve merchant docs for this product ──────────────
     strategy_rag = retrieve_context(
         merchant_id=merchant["id"],
         product_title=product.get("title", ""),
+        product_sku=merchant_sku,
         strategy_hint="",  # No strategy hint for Step 1
         top_k=5,  # More chunks for Step 1 since we're looking for specific product data
         sources=["merchant_docs"],  # Only merchant documents
@@ -178,17 +222,22 @@ def run_step1(merchant: dict, pool: dict) -> tuple[dict, dict]:
     )
 
     # ── Build prompt with both record data + document data ───
+    filtered_data = _filter_merchant_data_to_product(merchant, merchant_sku)
+    live_stock_qty, stock_source = get_stock_with_fallback(
+        merchant["id"], merchant_sku
+    )
     user_content = json.dumps({
         "merchant_record": {
             "merchant_name": merchant.get("name"),
             "margin_floor_pct": merchant.get("margin_floor_pct"),
-            "stock_data": merchant.get("stock_data"),
-            "accessory_inventory": merchant.get("accessory_inventory"),
-            "warranty_cost_data": merchant.get("warranty_cost_data"),
+            "live_shopify_stock_qty": live_stock_qty,
+            "stock_source": stock_source,
+            **filtered_data,
         },
         "retrieved_document_data": doc_context_text,
         "product": {
             "title": product.get("title"),
+            "sku": merchant_sku,
             "price": float(product.get("price", 0)),
         },
         "total_demand_qty": pool.get("_total_demand_qty", 1),
@@ -217,11 +266,15 @@ def run_step2(merchant: dict, pool: dict, strategy: dict) -> tuple[dict, dict]:
     Returns (offer_data, rag_context).
     """
     product = pool.get("_product", {})
+    merchant_sku = resolve_merchant_sku(
+        merchant["id"], pool["product_group_id"], product.get("title", "")
+    ) or product.get("sku", "")
 
     # Retrieve RAG context (all sources for Step 2)
     rag_context = retrieve_context(
         merchant_id=merchant["id"],
         product_title=product.get("title", ""),
+        product_sku=merchant_sku,
         strategy_hint=strategy.get("preferred_lever", ""),
     )
 
@@ -293,9 +346,13 @@ def validate_offer(offer: dict, strategy: dict, merchant: dict, pool: dict) -> t
     if list_price > 0:
         actual_discount_pct = ((list_price - offer_price) / list_price) * 100
         if actual_discount_pct > max_discount * 1.1:  # 10% tolerance
-            return "rejected", f"Discount {actual_discount_pct:.1f}% exceeds max {max_discount}%", 0.0
+            reason = f"Discount {actual_discount_pct:.1f}% exceeds max {max_discount}%"
+            logger.warning(f"Rejected offer: {reason}")
+            return "rejected", reason, 0.0
         if offer_price <= 0:
-            return "rejected", "Offer price is zero or negative", 0.0
+            reason = "Offer price is zero or negative"
+            logger.warning(f"Rejected offer: {reason}")
+            return "rejected", reason, 0.0
     else:
         actual_discount_pct = 0
 
@@ -376,19 +433,13 @@ def run_single_merchant_pipeline(merchant: dict, pool: dict) -> dict:
 
 # ── Orchestrator ─────────────────────────────────────────────
 
-async def run_offer_generation(pool_id: str) -> dict:
+async def run_offer_generation_round(pool_id: str, merchant_ids: list[str]) -> tuple[list[dict], list[dict]]:
     """
-    Orchestrate offer generation for all selected merchants in a pool.
-
-    Runs pipelines concurrently (semaphore-bounded) with failure isolation:
-    a single merchant's failure doesn't block others.
+    Core engine loop: run pipelines concurrently for the given merchants.
+    Returns (offers, failures).
     """
     pool = _fetch_pool_details(pool_id)
-    merchant_ids = pool.get("selected_merchant_ids", [])
-
-    if not merchant_ids:
-        return {"pool_id": pool_id, "error": "No selected merchants", "offers": []}
-
+    
     merchants = []
     for mid in merchant_ids:
         try:
@@ -397,7 +448,7 @@ async def run_offer_generation(pool_id: str) -> dict:
             logger.error(f"Failed to fetch merchant {mid}: {exc}")
 
     if not merchants:
-        return {"pool_id": pool_id, "error": "No valid merchants found", "offers": []}
+        return [], []
 
     # Run pipelines with bounded concurrency
     semaphore = asyncio.Semaphore(5)
@@ -424,6 +475,20 @@ async def run_offer_generation(pool_id: str) -> dict:
             failures.append({"merchant": merchant_name, "error": str(r)})
         else:
             offers.append(r)
+
+    return offers, failures
+
+async def run_offer_generation(pool_id: str) -> dict:
+    """
+    Orchestrate offer generation for all selected merchants in a pool.
+    """
+    pool = _fetch_pool_details(pool_id)
+    merchant_ids = pool.get("selected_merchant_ids", [])
+
+    if not merchant_ids:
+        return {"pool_id": pool_id, "error": "No selected merchants", "offers": []}
+        
+    offers, failures = await run_offer_generation_round(pool_id, merchant_ids)
 
     return {
         "pool_id": pool_id,
