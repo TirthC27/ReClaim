@@ -6,13 +6,14 @@ export default function PaymentSuccess() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const orderId = searchParams.get("order_id");
+  const cartRecoveryId = searchParams.get("cart_recovery_id");
   const [order, setOrder] = useState(null);
   const [polling, setPolling] = useState(true);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!orderId) {
-      setError("No order_id found in URL.");
+    if (!orderId && !cartRecoveryId) {
+      setError("No order_id or cart_recovery_id found in URL.");
       setPolling(false);
       return;
     }
@@ -20,7 +21,16 @@ export default function PaymentSuccess() {
     let intervalId;
     const poll = async () => {
       try {
-        const data = await fetchOrder(orderId);
+        let data;
+        if (orderId) {
+          data = await fetchOrder(orderId);
+        } else {
+          // Fetch cart recovery status
+          const res = await fetch(`http://localhost:8000/cart-recoveries/${cartRecoveryId}/summary`);
+          if (!res.ok) throw new Error("Failed to fetch cart recovery status");
+          const json = await res.json();
+          data = json.recovery;
+        }
         setOrder(data);
         if (data.status === "order_created") {
           setPolling(false);
@@ -35,7 +45,7 @@ export default function PaymentSuccess() {
     intervalId = setInterval(poll, 3000);
 
     return () => clearInterval(intervalId);
-  }, [orderId]);
+  }, [orderId, cartRecoveryId]);
 
   const statusIcon = (s) => {
     switch (s) {

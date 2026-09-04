@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { fetchDemandPools, generateOffers, API_BASE } from "../api";
+import { fetchDemandPools, fetchMultiProductPools, generateOffers, generateMultiProductOffers, API_BASE } from "../api";
 import { supabase } from "../supabaseClient";
 import { useDemoSession } from "../contexts/DemoSessionContext";
 
 export default function DemandDashboard() {
   const [pools, setPools] = useState([]);
+  const [multiPools, setMultiPools] = useState([]);
   const [error, setError] = useState("");
   const [generating, setGenerating] = useState(null);
   const navigate = useNavigate();
@@ -55,8 +56,12 @@ export default function DemandDashboard() {
   const load = async () => {
     try {
       setError("");
-      const data = await fetchDemandPools();
+      const [data, multiData] = await Promise.all([
+        fetchDemandPools(),
+        fetchMultiProductPools()
+      ]);
       setPools(data);
+      setMultiPools(multiData);
     } catch (e) {
       setError(e.message || "Failed to load demand pools");
     }
@@ -81,23 +86,34 @@ export default function DemandDashboard() {
     };
   }, []);
 
-  const handleGenerate = async (poolId) => {
+  const handleGenerate = async (poolId, isMulti = false) => {
     setGenerating(poolId);
     setError("");
     try {
-      const res = await generateOffers(poolId);
-      if (res.failures > 0) {
-        setError(
-          `Offer generation completed with ${res.failures} failures. Details: ${JSON.stringify(
-            res.failure_details
-          )}`
-        );
+      if (isMulti) {
+        const res = await generateMultiProductOffers(poolId);
+        if (res.allocation_error) {
+          setError(`Allocation error: ${res.allocation_error}`);
+        } else {
+          alert(`Bundle generation complete! Generated ${res.validated_offers} valid bundle offers from ${res.merchants_processed} merchants.`);
+          load();
+        }
+      } else {
+        const res = await generateOffers(poolId);
+        if (res.failures > 0) {
+          setError(
+            `Offer generation completed with ${res.failures} failures. Details: ${JSON.stringify(
+              res.failure_details
+            )}`
+          );
+        }
+        setPoolId(poolId);
+        setDemandSignalId(null);
+        navigate(`/pools/${poolId}/competition`);
       }
-      setPoolId(poolId);
-      setDemandSignalId(null);
-      navigate(`/pools/${poolId}/competition`);
     } catch (e) {
       setError(e.message || "Failed to trigger offer generation");
+    } finally {
       setGenerating(null);
     }
   };
@@ -199,6 +215,46 @@ export default function DemandDashboard() {
               >
                 View
               </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <h3 style={{ marginTop: 40 }}>Multi-Product Cart Pools (Bundles)</h3>
+      <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
+        {multiPools.length === 0 && <p style={{ opacity: 0.6 }}>No multi-product pools found.</p>}
+        {multiPools.map((p) => (
+          <div
+            key={p.id}
+            style={{
+              border: "1px solid #7c3aed",
+              borderRadius: 12,
+              padding: 12,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              background: "rgba(124, 58, 237, 0.05)"
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: "8px", color: "#7c3aed" }}>
+                Basket: {p.basket_signature?.substring(0, 16)}...
+              </div>
+              <div style={{ fontSize: 14, opacity: 0.8 }}>
+                customers: {p.cart_count} · items: {p.total_items} · status: <strong style={{color: p.status === 'open' ? '#3b82f6' : '#10b981'}}>{p.status}</strong>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {p.status === "open" && (
+                <button
+                  className="btn btn-primary"
+                  style={{ background: "#7c3aed", borderColor: "#7c3aed" }}
+                  onClick={() => handleGenerate(p.id, true)}
+                  disabled={generating === p.id}
+                >
+                  {generating === p.id ? "Bundling..." : "🛍️ Bundle Offer Engine"}
+                </button>
+              )}
             </div>
           </div>
         ))}

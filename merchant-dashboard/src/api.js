@@ -114,6 +114,18 @@ export const negotiatePool = async (poolId) => {
   return response.json();
 };
 
+export const fetchMultiProductPools = () => request("/demand-pools/multi-product");
+
+export const generateMultiProductOffers = async (poolId) => {
+  const response = await fetch(`${API_BASE}/multi-product-pools/${poolId}/generate-offers`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error("Failed to generate bundle offers");
+  }
+  return response.json();
+};
+
 export const fetchNegotiationRounds = async (poolId) => {
   const response = await fetch(`${API_BASE}/demand-pools/${poolId}/negotiation-rounds`);
   if (!response.ok) {
