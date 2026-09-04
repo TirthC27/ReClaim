@@ -74,6 +74,7 @@ def aggregate_demand_for_group(product_group_id: str) -> dict | None:
         .select("id, merchant_id")
         .eq("product_group_id", group_id)
         .eq("status", "abandoned")
+        .is_("multi_product_pool_id", "null")
         .execute()
         .data
     )
@@ -137,11 +138,11 @@ def aggregate_demand_for_group(product_group_id: str) -> dict | None:
             "updated_at": "now()",
         }).eq("id", str(pool_id)).execute()
 
-        # Mark signals as pooled
+        # Mark signals as pooled (only those not in multi-product pools)
         sb.table("demand_signals").update({
             "status": "pooled",
             "demand_pool_id": str(pool_id),
-        }).eq("product_group_id", group_id).eq("status", "abandoned").execute()
+        }).eq("product_group_id", group_id).eq("status", "abandoned").is_("multi_product_pool_id", "null").execute()
 
         logger.info(
             f"Pool {pool_id} for group {group_id}: "

@@ -129,6 +129,19 @@ def check_abandoned_carts():
                 f"{len(signals)} signals flipped"
             )
 
+        # ── NEW: Multi-product pool classification ───────────
+        from app.services.multi_product_aggregation import (
+            classify_cart, aggregate_multi_product_demand
+        )
+        for cart in stale_carts:
+            cart_id = str(cart["id"])
+            cart_type = classify_cart(cart_id)
+            if cart_type == "multi":
+                try:
+                    aggregate_multi_product_demand(cart_id)
+                except Exception as exc:
+                    logger.error(f"Multi-product aggregation failed for cart {cart_id}: {exc}")
+
         # ── Trigger aggregation for each affected group ──────
         for group_id in affected_groups:
             try:

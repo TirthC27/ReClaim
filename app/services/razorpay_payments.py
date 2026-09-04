@@ -3,8 +3,12 @@ from base64 import b64encode
 
 import razorpay
 import requests
+import logging
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+
 
 
 import time
@@ -27,19 +31,37 @@ def create_payment_link(*, amount_paise: int, description: str, notes: dict, cal
         payload["customer"] = {"email": customer_email}
         payload["notify"] = {"sms": False, "email": True}
 
-    resp = requests.post(
-        "https://api.razorpay.com/v1/payment_links",
-        headers={
-            "Authorization": f"Basic {auth}",
-            "Content-Type": "application/json",
-        },
-        data=json.dumps(payload),
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    url = "https://api.razorpay.com/v1/payment_links"
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            
+            if response.status_code == 429 and attempt < max_retries - 1:
+                logger.warning(f"Razorpay rate limit hit. Retrying in {2 ** attempt} seconds...")
+                time.sleep(2 ** attempt)
+                continue
+                
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Failed to generate Razorpay link: {e}")
+                if hasattr(e, "response") and e.response is not None:
+                    logger.error(f"Response: {e.response.text}")
+                raise
+            time.sleep(2 ** attempt)
+            
+    return {}
 
 
 def verify_webhook_signature(*, payload: bytes, signature: str) -> None:
     razorpay.Utility.verify_webhook_signature(payload, signature, settings.RAZORPAY_WEBHOOK_SECRET)
-

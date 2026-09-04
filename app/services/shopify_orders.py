@@ -111,6 +111,7 @@ def create_shopify_order(order_id: UUID | str) -> dict:
     offer_price = float(offer.get("price") or 0)
     payload = {
         "order": {
+            "email": customer_email,
             "line_items": [
                 {
                     "variant_id": variant_id,
@@ -258,6 +259,7 @@ def create_shopify_cart_recovery_order(cart_recovery_id: UUID | str) -> dict:
     
     payload = {
         "order": {
+            "email": customer_email,
             "line_items": line_items,
             "customer": {"id": customer_id},
             "financial_status": "paid",
