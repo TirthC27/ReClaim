@@ -15,6 +15,22 @@ def list_demand_pools(limit: int = 100, offset: int = 0):
     return svc.list_demand_pools(limit=limit, offset=offset)
 
 
+@router.get("/multi-product")
+def list_multi_product_pools(limit: int = 100, offset: int = 0):
+    """List all multi-product pools."""
+    from app.db.client import get_supabase
+    sb = get_supabase()
+    rows = (
+        sb.table("multi_product_pools")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+    )
+    return rows
+
+
 @router.get("/{pool_id}")
 def get_demand_pool(pool_id: UUID):
     row = svc.get_demand_pool(pool_id)

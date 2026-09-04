@@ -172,3 +172,42 @@ def get_negotiation_rounds(pool_id: UUID):
     ).order("round_number").order("created_at").execute().data
     
     return {"pool_id": str(pool_id), "rounds": rounds}
+
+
+@router.post("/multi-product-pools/{pool_id}/generate-offers")
+async def generate_multi_product_offers(pool_id: UUID):
+    """
+    Trigger the bundle offer generation pipeline for a multi-product pool.
+    Runs the 3-step bundle engine for selected merchants, then calls the
+    buyer agent to create the optimal split/single allocation.
+    """
+    from app.services.bundle_offer_engine import run_bundle_offer_generation
+    from app.services.bundle_buyer_agent import run_bundle_buyer_agent
+    from app.services.bundle_allocation import allocate_bundle_orders
+    
+    # 1. Run generation
+    generation_result = await run_bundle_offer_generation(str(pool_id))
+    
+    if generation_result.get("error"):
+        raise HTTPException(status_code=400, detail=generation_result["error"])
+        
+    if generation_result.get("validated_offers", 0) > 0:
+        try:
+            # 2. Run Buyer Agent
+            buyer_result = run_bundle_buyer_agent(str(pool_id))
+            generation_result["buyer_agent"] = buyer_result
+            
+            # 3. Execute Allocation
+            allocation_plan = buyer_result.get("allocation_plan", [])
+            if allocation_plan:
+                alloc_result = allocate_bundle_orders(str(pool_id), allocation_plan)
+                generation_result["allocation"] = alloc_result
+            else:
+                logger.warning(f"No allocation plan generated for multi-product pool {pool_id}")
+                
+        except Exception as exc:
+            logger.error(f"Bundle allocation failed for pool {pool_id}: {exc}", exc_info=True)
+            generation_result["allocation_error"] = str(exc)
+            
+    return generation_result
+
