@@ -1,51 +1,77 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { fetchOffers, selectOffer } from "../api";
-import { useDemoSession } from "../contexts/DemoSessionContext";
+import { fetchBundleOffers, selectBundleOffer } from "../api";
 
-const CATEGORY_MAP = {
-  discount: { label: "Best Price", icon: "💰", color: "#10b981" },
-  gift: { label: "Best Value", icon: "🎁", color: "#6366f1" },
-  bundle: { label: "Bundle", icon: "📦", color: "#f59e0b" },
-  warranty: { label: "Protection", icon: "🛡️", color: "#3b82f6" },
-  upgrade: { label: "Best Value", icon: "⬆️", color: "#6366f1" },
-  service: { label: "Best Value", icon: "🔧", color: "#6366f1" },
-  hybrid: { label: "Best Value", icon: "✨", color: "#8b5cf6" },
+const STATUS_CONFIG = {
+  FULLY_FULFILLED: { label: "Full Coverage", icon: "✅", color: "#10b981" },
+  PARTIALLY_FULFILLED: { label: "Partial Coverage", icon: "⚠️", color: "#f59e0b" },
+  UNFULFILLED: { label: "Unavailable", icon: "❌", color: "#ef4444" },
 };
+
+function PartialFulfillmentBanner({ offer }) {
+  const snapshot = offer.allocation_snapshot || {};
+  const unfulfilled = snapshot.unfulfilled_items || [];
+  const pct = offer.coverage_percentage ?? 0;
+
+  return (
+    <div
+      style={{
+        background: "#fef3c7",
+        border: "1px solid #fbbf24",
+        borderRadius: 8,
+        padding: "12px 16px",
+        marginBottom: 12,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: "1.2rem" }}>⚠️</span>
+        <strong style={{ color: "#92400e" }}>
+          Partial Fulfillment — {pct.toFixed(1)}% of your basket covered
+        </strong>
+      </div>
+      <p style={{ fontSize: "0.88rem", color: "#78350f", margin: "0 0 8px" }}>
+        Some items in your cart are currently unavailable. The following items will{" "}
+        <strong>not</strong> be included in this order:
+      </p>
+      <ul style={{ margin: 0, paddingLeft: 20, fontSize: "0.88rem", color: "#92400e" }}>
+        {unfulfilled.map((item, i) => (
+          <li key={i}>
+            <strong>{item.sku}</strong> × {item.quantity}{" "}
+            <span style={{ opacity: 0.7 }}>({item.reason})</span>
+          </li>
+        ))}
+      </ul>
+      <p style={{ fontSize: "0.83rem", color: "#78350f", margin: "8px 0 0" }}>
+        By continuing, you acknowledge that you are purchasing only the available items listed above.
+      </p>
+    </div>
+  );
+}
 
 export default function OfferMarketplace() {
   const { poolId } = useParams();
   const navigate = useNavigate();
-  const { demandSignalId, setDemandSignalId } = useDemoSession();
   const [offers, setOffers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selecting, setSelecting] = useState(null);
   const [error, setError] = useState("");
-  const [localSignalId, setLocalSignalId] = useState(demandSignalId || "");
 
   useEffect(() => {
-    fetchOffers(poolId, "validated")
+    fetchBundleOffers(poolId, "validated")
       .then(setOffers)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }, [poolId]);
 
   const handleSelect = async (offerId) => {
-    const sid = localSignalId || demandSignalId;
-    if (!sid) {
-      setError("Enter a demand_signal_id first (simulate being a specific customer).");
-      return;
-    }
-    setDemandSignalId(sid);
     setSelecting(offerId);
     setError("");
     try {
-      const result = await selectOffer(offerId, sid);
-      // Redirect to payment
+      const result = await selectBundleOffer(offerId);
       if (result.payment_link_url) {
         window.location.href = result.payment_link_url;
       } else {
-        navigate(`/payment-success?order_id=${result.order_id}`);
+        navigate(`/payment-success?bundle_offer_id=${offerId}`);
       }
     } catch (e) {
       setError(e.message);
@@ -59,7 +85,7 @@ export default function OfferMarketplace() {
       <div className="card-header">
         <div className="step-badge">🛒</div>
         <div>
-          <h2>Offer Marketplace</h2>
+          <h2>Bundle Offer Marketplace</h2>
           <p className="subtitle">
             Choose the best offer for pool{" "}
             <code>{String(poolId).slice(0, 8)}…</code>
@@ -69,35 +95,24 @@ export default function OfferMarketplace() {
 
       {error && <div className="alert alert-error">{error}</div>}
 
-      {/* Signal ID input for demo */}
-      <div className="form-group" style={{ marginBottom: 24 }}>
-        <label htmlFor="signal-id">Your Demand Signal ID (demo)</label>
-        <input
-          id="signal-id"
-          type="text"
-          placeholder="Paste your demand_signal_id..."
-          value={localSignalId}
-          onChange={(e) => setLocalSignalId(e.target.value)}
-        />
-        <span className="hint">
-          This identifies which customer you are — required for allocation-fair offer selection.
-        </span>
-      </div>
-
       {loading ? (
         <div className="skeleton-list">
           {[1, 2, 3].map((i) => (
-            <div key={i} className="skeleton" style={{ height: 140 }} />
+            <div key={i} className="skeleton" style={{ height: 180 }} />
           ))}
         </div>
       ) : offers.length === 0 ? (
         <div className="empty-state">
-          <p>No validated offers available for this pool yet.</p>
+          <p>No validated bundle offers available for this pool yet.</p>
         </div>
       ) : (
         <div className="product-list">
           {offers.map((o) => {
-            const cat = CATEGORY_MAP[o.offer_type] || CATEGORY_MAP.hybrid;
+            const isPartial = o.fulfillment_status === "PARTIALLY_FULFILLED";
+            const isUnfulfilled = o.fulfillment_status === "UNFULFILLED";
+            const statusCfg = STATUS_CONFIG[o.fulfillment_status] || STATUS_CONFIG.FULLY_FULFILLED;
+            const borderColor = statusCfg.color;
+
             return (
               <div
                 key={o.id}
@@ -106,41 +121,114 @@ export default function OfferMarketplace() {
                   flexDirection: "column",
                   alignItems: "stretch",
                   gap: 12,
-                  borderLeft: `4px solid ${cat.color}`,
+                  borderLeft: `4px solid ${borderColor}`,
+                  opacity: isUnfulfilled ? 0.6 : 1,
                 }}
               >
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                {/* Header row */}
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                   <div>
-                    <span style={{ fontSize: "1.5rem", marginRight: 8 }}>{cat.icon}</span>
-                    <span className="badge" style={{ background: cat.color + "22", color: cat.color, marginRight: 8 }}>
-                      {cat.label}
+                    <span style={{ fontSize: "1.4rem", marginRight: 8 }}>{statusCfg.icon}</span>
+                    <span
+                      className="badge"
+                      style={{ background: borderColor + "22", color: borderColor, marginRight: 8 }}
+                    >
+                      {statusCfg.label}
                     </span>
-                    <strong style={{ fontSize: "1.2rem" }}>
-                      ₹{Number(o.price).toLocaleString("en-IN")}
+                    {o.merchant_count > 1 && (
+                      <span
+                        className="badge"
+                        style={{ background: "#6366f122", color: "#6366f1", marginRight: 8 }}
+                      >
+                        {o.merchant_count} Merchants
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <strong style={{ fontSize: "1.3rem" }}>
+                      ₹{Number(o.total_price).toLocaleString("en-IN")}
                     </strong>
+                    {o.bundle_discount > 0 && (
+                      <div style={{ fontSize: "0.82rem", color: "#10b981" }}>
+                        Save ₹{Number(o.bundle_discount).toLocaleString("en-IN")}
+                      </div>
+                    )}
                   </div>
                 </div>
 
-                {o.description && (
-                  <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem", margin: 0, lineHeight: 1.5 }}>
-                    {o.description}
-                  </p>
-                )}
-
-                {o.bundled_items && o.bundled_items.length > 0 && (
-                  <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
-                    🎁 Includes: {o.bundled_items.join(", ")}
+                {/* Coverage progress bar */}
+                {o.coverage_percentage != null && (
+                  <div>
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        fontSize: "0.82rem",
+                        color: "var(--text-secondary)",
+                        marginBottom: 4,
+                      }}
+                    >
+                      <span>Coverage</span>
+                      <span>
+                        {o.fulfilled_units}/{o.requested_units} units ({Number(o.coverage_percentage).toFixed(1)}%)
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        height: 6,
+                        background: "var(--bg-secondary)",
+                        borderRadius: 3,
+                        overflow: "hidden",
+                      }}
+                    >
+                      <div
+                        style={{
+                          height: "100%",
+                          width: `${o.coverage_percentage}%`,
+                          background: borderColor,
+                          borderRadius: 3,
+                          transition: "width 0.4s ease",
+                        }}
+                      />
+                    </div>
                   </div>
                 )}
 
+                {/* Line items breakdown */}
+                {o.line_items && o.line_items.length > 0 && (
+                  <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
+                    {o.line_items.map((li, i) => (
+                      <div
+                        key={i}
+                        style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}
+                      >
+                        <span>📦 {li.product_group_id?.slice(0, 8)}… ×{li.quantity}</span>
+                        <span>₹{Number(li.line_total).toLocaleString("en-IN")}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Partial fulfillment banner */}
+                {isPartial && <PartialFulfillmentBanner offer={o} />}
+
+                {/* CTA button */}
                 <button
-                  className="btn btn-primary"
-                  disabled={selecting === o.id || !localSignalId}
+                  className={isPartial ? "btn" : "btn btn-primary"}
+                  disabled={selecting === o.id || isUnfulfilled}
                   onClick={() => handleSelect(o.id)}
-                  style={{ alignSelf: "flex-start" }}
+                  style={{
+                    alignSelf: "flex-start",
+                    background: isPartial ? "#f59e0b" : undefined,
+                    color: isPartial ? "#fff" : undefined,
+                  }}
                 >
                   {selecting === o.id ? (
                     <><span className="spinner" /> Processing…</>
+                  ) : isPartial ? (
+                    "Continue with Available Items →"
+                  ) : isUnfulfilled ? (
+                    "Unavailable"
                   ) : (
                     "Select & Pay →"
                   )}
@@ -153,7 +241,12 @@ export default function OfferMarketplace() {
 
       <button
         className="btn"
-        style={{ background: "var(--bg-secondary)", color: "var(--text-secondary)", border: "1px solid var(--border)", marginTop: 16 }}
+        style={{
+          background: "var(--bg-secondary)",
+          color: "var(--text-secondary)",
+          border: "1px solid var(--border)",
+          marginTop: 16,
+        }}
         onClick={() => navigate(`/pools/${poolId}/competition`)}
       >
         ← Back to Competition

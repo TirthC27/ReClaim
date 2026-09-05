@@ -5,6 +5,7 @@ import MerchantCompetition from "./pages/MerchantCompetition";
 import OfferMarketplace from "./pages/OfferMarketplace";
 import AllocationView from "./pages/AllocationView";
 import PaymentSuccess from "./pages/PaymentSuccess";
+import NegotiationRoom from "./pages/NegotiationRoom";
 import "./App.css";
 
 const NAV_ITEMS = [
@@ -51,6 +52,7 @@ export default function App() {
           <Route path="/pools/:poolId/competition" element={<MerchantCompetition />} />
           <Route path="/pools/:poolId/marketplace" element={<OfferMarketplace />} />
           <Route path="/pools/:poolId/allocations" element={<AllocationView />} />
+          <Route path="/pools/:poolId/negotiation" element={<NegotiationRoom />} />
           <Route path="/payment-success" element={<PaymentSuccess />} />
 
           {/* Merchant-facing */}

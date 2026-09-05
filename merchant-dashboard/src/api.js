@@ -133,3 +133,35 @@ export const fetchNegotiationRounds = async (poolId) => {
   }
   return response.json();
 };
+
+export const startBundleNegotiation = async (poolId) => {
+  const response = await fetch(`${API_BASE}/multi-product-pools/${poolId}/negotiate`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error("Failed to start negotiation");
+  }
+  return response.json();
+};
+
+export const fetchBundleNegotiationRounds = async (poolId) => {
+  const response = await fetch(`${API_BASE}/multi-product-pools/${poolId}/negotiation-rounds`);
+  if (!response.ok) {
+    throw new Error("Failed to fetch negotiation rounds");
+  }
+  return response.json();
+};
+
+export const getNegotiationStreamUrl = (poolId) =>
+  `${API_BASE}/multi-product-pools/${poolId}/negotiation/stream`;
+
+// ── Bundle Offers (multi-product, multi-merchant) ──────────
+export const fetchBundleOffers = (poolId, status) => {
+  const qs = new URLSearchParams();
+  if (poolId) qs.set("pool_id", poolId);
+  if (status) qs.set("status", status);
+  return request(`/bundle-offers?${qs.toString()}`);
+};
+
+export const selectBundleOffer = (offerId) =>
+  request(`/bundle-offers/${offerId}/select`, { method: "POST" });

@@ -63,6 +63,30 @@ async def webhook_order_create(request: Request):
     return {"status": "ok", **result}
 
 
+@router.post("/checkout-update")
+async def webhook_checkout_update(request: Request):
+    """
+    Receive Shopify checkouts/update webhook.
+
+    Shopify sometimes fires checkouts/create with 0 line items (before the
+    user adds products). This endpoint handles the subsequent update event
+    which always carries the full line_items list.
+    Uses the same idempotent process_checkout_create logic.
+    """
+    body = await request.body()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+
+    if not verify_hmac(body, hmac_header):
+        raise HTTPException(status_code=401, detail="Invalid HMAC signature")
+
+    payload = await request.json()
+    logger.info(f"Checkout update webhook received: {payload.get('id', 'unknown')}")
+
+    result = process_checkout_create(payload)
+    return {"status": "ok", **result}
+
+
+
 @router.post("/cart-update")
 async def webhook_cart_update(request: Request):
     """

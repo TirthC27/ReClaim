@@ -152,12 +152,28 @@ def _chunk_csv(text: str, filename: str) -> list[dict]:
 
             # For PRODUCT QUOTATION, chunk each product row individually
             if section["name"] == "PRODUCT QUOTATION":
+                # Header columns for metadata extraction
+                headers = [h.strip() for h in global_col_header.split(",")]
+                sku_idx = headers.index("SKU") if "SKU" in headers else -1
+                prod_idx = headers.index("Product") if "Product" in headers else -1
+                cat_idx = headers.index("Category") if "Category" in headers else -1
+
                 # All rows in this section are data rows (col 0 stripped), use global header
                 for i, data_row in enumerate(section["rows"], 1):
                     row_text = f"[{section['name']} — Row {i}]\n{global_col_header}\n{','.join(data_row)}"
+                    
+                    metadata = None
+                    if sku_idx >= 0 and len(data_row) > sku_idx:
+                        metadata = {
+                            "sku": data_row[sku_idx].strip(),
+                            "product_name": data_row[prod_idx].strip() if prod_idx >= 0 and len(data_row) > prod_idx else "",
+                            "category": data_row[cat_idx].strip() if cat_idx >= 0 and len(data_row) > cat_idx else ""
+                        }
+
                     chunks.append({
                         "chunk_name": f"{filename} | {section['name']} Row {i}",
                         "text": row_text,
+                        "metadata": metadata
                     })
             else:
                 # Other sections: keep as one chunk
@@ -222,13 +238,18 @@ def upload_document(merchant_id: UUID, filename: str, file_bytes: bytes) -> dict
         chunks = _chunk_csv(extracted_text, filename)
     else:
         # Non-CSV: single chunk = whole file
-        chunks = [{"chunk_name": filename, "text": extracted_text}]
+        chunks = [{"chunk_name": filename, "text": extracted_text, "metadata": None}]
+
+    # ── Fetch merchant info for metadata ─────────────────────
+    merchant = sb.table("merchants").select("name").eq("id", str(merchant_id)).execute().data
+    merchant_name = merchant[0]["name"] if merchant else ""
 
     # ── 4 & 5. Embed + insert each chunk ─────────────────────
     inserted_rows = []
     for chunk in chunks:
         chunk_text = chunk["text"]
         chunk_name = chunk["chunk_name"]
+        raw_meta = chunk.get("metadata")
 
         embedding: list[float] | None = None
         if chunk_text:
@@ -244,6 +265,17 @@ def upload_document(merchant_id: UUID, filename: str, file_bytes: bytes) -> dict
             "file_url": file_url,
             "extracted_text": chunk_text or None,
         }
+        
+        if raw_meta:
+            row["metadata"] = {
+                "source_type": "merchant_quotation",
+                "merchant_id": str(merchant_id),
+                "merchant_name": merchant_name,
+                "sku": raw_meta.get("sku", ""),
+                "product_name": raw_meta.get("product_name", ""),
+                "category": raw_meta.get("category", "")
+            }
+
         if embedding:
             row["embedding"] = str(embedding)
 
@@ -331,8 +363,11 @@ def auto_group_from_quotation(merchant_id: UUID, extracted_text: str):
             group_id = new_group["id"]
             
         # 2. Add to merchant_products map
-        # Use the real Shopify Product ID if found, otherwise fallback to a demo ID
-        shopify_product_id = sku_to_shopify_id.get(sku, f"demo_shp_{sku}")
+        # Never persist a synthetic Shopify ID into the real merchant mapping.
+        shopify_product_id = sku_to_shopify_id.get(sku)
+        if not shopify_product_id:
+            logger.warning("Skipping quotation SKU %s for merchant %s: no Shopify mapping", sku, merchant_id)
+            continue
         
         # Upsert mapping
         sb.table("merchant_products").upsert({

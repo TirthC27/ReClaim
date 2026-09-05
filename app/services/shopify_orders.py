@@ -73,7 +73,7 @@ def create_shopify_order(order_id: UUID | str) -> dict:
 
     signal_rows = (
         sb.table("demand_signals")
-        .select("id, product_group_id, carts(customer_email)")
+        .select("id, product_group_id, quantity, carts(customer_email)")
         .eq("id", str(demand_signal_id))
         .limit(1)
         .execute()
@@ -84,7 +84,9 @@ def create_shopify_order(order_id: UUID | str) -> dict:
 
     signal = signal_rows[0]
     cart = signal.get("carts") or {}
-    customer_email = cart.get("customer_email") or "demo@example.com"
+    customer_email = cart.get("customer_email")
+    if not customer_email:
+        raise ValueError("Cannot create Shopify order: customer email is missing")
 
     merchant_id = order.get("merchant_id")
     if not merchant_id:
@@ -115,7 +117,7 @@ def create_shopify_order(order_id: UUID | str) -> dict:
             "line_items": [
                 {
                     "variant_id": variant_id,
-                    "quantity": 1,
+                    "quantity": int(signal.get("quantity") or 1),
                     "price": offer_price,
                 }
             ],
@@ -188,13 +190,15 @@ def create_shopify_cart_recovery_order(cart_recovery_id: UUID | str) -> dict:
     if recovery.get("status") == "order_created" and recovery.get("shopify_order_id"):
         return {"status": "already_created", "shopify_order_id": recovery.get("shopify_order_id")}
         
-    customer_email = recovery.get("customer_email") or "demo@example.com"
+    customer_email = recovery.get("customer_email")
+    if not customer_email:
+        raise ValueError("Cannot create Shopify recovery order: customer email is missing")
     customer_id = find_or_create_shopify_customer(customer_email)
     
-    # 2. Fetch cart_recovery_items with product_group_id via demand_signals
+    # 2. Fetch cart_recovery_items with product_group_id and quantity via demand_signals
     items_resp = (
         sb.table("cart_recovery_items")
-        .select("*, demand_signals(product_group_id, product_id), offers(description)")
+        .select("*, demand_signals(product_group_id, product_id, quantity), offers(description)")
         .eq("cart_recovery_id", recovery_id_str)
         .execute()
         .data
@@ -209,7 +213,11 @@ def create_shopify_cart_recovery_order(cart_recovery_id: UUID | str) -> dict:
     # 3. Resolve variant for each item
     for item in items_resp:
         merchant_id = item.get("merchant_id")
-        price = float(item.get("price") or 0)
+        line_total = float(item.get("price") or 0)
+        # Get real quantity from demand_signals (not hardcoded 1)
+        actual_qty = int(item.get("demand_signals", {}).get("quantity", 1) or 1)
+        # Shopify expects unit price — it multiplies by quantity internally
+        shopify_unit_price = round(line_total / actual_qty, 2) if actual_qty > 0 else line_total
         product_group_id = item.get("demand_signals", {}).get("product_group_id")
         desc = (item.get("offers") or {}).get("description")
         if desc:
@@ -248,8 +256,8 @@ def create_shopify_cart_recovery_order(cart_recovery_id: UUID | str) -> dict:
         
         line_items.append({
             "variant_id": variant_id,
-            "quantity": 1,
-            "price": price
+            "quantity": actual_qty,
+            "price": shopify_unit_price
         })
 
     if not line_items:
@@ -287,6 +295,8 @@ def create_shopify_cart_recovery_order(cart_recovery_id: UUID | str) -> dict:
         sb.table("cart_recoveries").update({
             "status": "order_created",
             "shopify_order_id": shopify_order_id,
+            "order_creation_failed": False,
+            "last_shopify_error": None,
             "updated_at": "now()",
         }).eq("id", recovery_id_str).execute()
         
@@ -295,6 +305,8 @@ def create_shopify_cart_recovery_order(cart_recovery_id: UUID | str) -> dict:
         logger.error(f"Shopify cart recovery order creation failed for {recovery_id_str}: {exc}")
         sb.table("cart_recoveries").update({
             "status": "paid", # Keep paid, but order failed
+            "order_creation_failed": True,
+            "last_shopify_error": str(exc)[:5000],
             "updated_at": "now()",
         }).eq("id", recovery_id_str).execute()
         raise

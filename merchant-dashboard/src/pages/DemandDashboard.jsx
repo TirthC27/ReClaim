@@ -199,11 +199,10 @@ export default function DemandDashboard() {
             <div style={{ display: "flex", gap: 8 }}>
               {p.status === "open" && (
                 <button
-                  className="btn btn-primary"
-                  onClick={() => handleGenerate(p.id)}
-                  disabled={generating === p.id}
+                  className="btn"
+                  onClick={() => navigate(`/pools/${p.id}/negotiation`)}
                 >
-                  {generating === p.id ? "Evaluating..." : "⚡ Trigger Agents"}
+                  🤝 Enter Negotiation Room
                 </button>
               )}
               <button
@@ -249,10 +248,9 @@ export default function DemandDashboard() {
                 <button
                   className="btn btn-primary"
                   style={{ background: "#7c3aed", borderColor: "#7c3aed" }}
-                  onClick={() => handleGenerate(p.id, true)}
-                  disabled={generating === p.id}
+                  onClick={() => navigate(`/pools/${p.id}/negotiation`)}
                 >
-                  {generating === p.id ? "Bundling..." : "🛍️ Bundle Offer Engine"}
+                  🤝 Enter Negotiation Room
                 </button>
               )}
             </div>

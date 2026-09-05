@@ -29,6 +29,7 @@ from app.routers import (
     demand_signals,
     cart_recoveries,
     demo,
+    bundle_offers,
 )
 from app.services.abandonment_worker import start_scheduler, stop_scheduler
 
@@ -79,4 +80,5 @@ app.include_router(razorpay_webhooks.router)
 app.include_router(offer_generation.router)
 app.include_router(demand_signals.router)
 app.include_router(cart_recoveries.router)
+app.include_router(bundle_offers.router)
 app.include_router(demo.router)

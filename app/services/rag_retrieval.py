@@ -247,3 +247,74 @@ def _fallback_query(
     except Exception as exc:
         logger.warning(f"[RAG] Fallback query failed on {table}: {exc}")
         return []
+
+
+def retrieve_buyer_context(
+    product_titles: str = "",
+    top_k: int = 3,
+) -> dict:
+    """
+    Retrieve RAG context for the Buyer Agent.
+
+    The Buyer Agent needs DIFFERENT information than the Seller Agent:
+    - Fulfillment policies (prefer single merchant, split-order rules)
+    - Customer experience policies (delivery speed, reliability)
+    - Bundle strategy rules (when to combine offers)
+    - Merchant reliability data
+
+    This queries archetypes (platform-level policies) and all merchant docs
+    (cross-merchant, for platform-wide fulfillment rules).
+
+    The Seller Agent queries merchant_docs scoped to ONE merchant for pricing.
+    The Buyer Agent queries archetypes + all docs for fulfillment/strategy.
+    """
+    query_text = (
+        f"fulfillment policy customer experience bundle strategy "
+        f"merchant reliability split order single merchant preference "
+        f"{product_titles}"
+    ).strip()
+
+    try:
+        query_embedding = generate_embedding(query_text)
+    except Exception as exc:
+        logger.error(f"[Buyer RAG] Failed to embed query: {exc}")
+        return {"archetypes": [], "policy_docs": [], "error": str(exc)}
+
+    logger.info(f"[Buyer RAG] Query embedding generated — text='{query_text[:80]}...'")
+
+    sb = get_supabase()
+
+    # 1. Offer archetypes (platform-level strategy patterns)
+    archetypes = _rpc_match_offer_archetypes(sb, query_embedding, top_k)
+    logger.info(f"[Buyer RAG] archetypes: {len(archetypes)} rows")
+
+    # 2. All merchant docs (cross-merchant fulfillment policies)
+    # Note: we pass merchant_id="" and use the fallback which queries all docs
+    policy_docs = []
+    try:
+        result = sb.table("merchant_documents").select(
+            "id, file_name, extracted_text"
+        ).ilike(
+            "extracted_text", "%fulfillment%"
+        ).limit(top_k).execute()
+        policy_docs = [dict(r, similarity=None) for r in (result.data or [])]
+    except Exception:
+        pass
+
+    # If no fulfillment-specific docs found, try broader policy search
+    if not policy_docs:
+        try:
+            result = sb.table("merchant_documents").select(
+                "id, file_name, extracted_text"
+            ).ilike(
+                "extracted_text", "%policy%"
+            ).limit(top_k).execute()
+            policy_docs = [dict(r, similarity=None) for r in (result.data or [])]
+        except Exception:
+            pass
+
+    return {
+        "archetypes": archetypes,
+        "policy_docs": policy_docs,
+    }
+

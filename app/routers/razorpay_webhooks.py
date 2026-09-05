@@ -62,6 +62,23 @@ async def payment_link_paid(request: Request):
             "status": "paid",
             "updated_at": "now()"
         }).eq("id", str(cart_recovery_id)).execute()
+
+        recovery_items = sb.table("cart_recovery_items").select(
+            "bundle_offer_id"
+        ).eq("cart_recovery_id", str(cart_recovery_id)).execute().data or []
+        bundle_offer_ids = list({
+            row["bundle_offer_id"] for row in recovery_items
+            if row.get("bundle_offer_id")
+        })
+        for bundle_offer_id in bundle_offer_ids:
+            sb.table("bundle_offers").update({"payment_status": "PAID"}).eq(
+                "id", bundle_offer_id
+            ).execute()
+            sb.table("payments").update({
+                "status": "paid",
+                "razorpay_payment_id": razorpay_payment_id,
+                "raw_webhook_payload": payload,
+            }).eq("bundle_offer_id", bundle_offer_id).execute()
         
         try:
             result = create_shopify_cart_recovery_order(cart_recovery_id)
@@ -69,7 +86,7 @@ async def payment_link_paid(request: Request):
         except Exception as e:
             import logging
             logging.error(f"Shopify order creation failed: {e}")
-            return {"status": "ok", "shopify": {"status": "queued_for_retry"}}
+            raise HTTPException(status_code=500, detail="Shopify order creation failed; retry required")
     else:
         # ── Single Order Flow (Backward Compatibility) ──
         order_id = UUID(str(order_id_raw))

@@ -8,7 +8,8 @@ GET  /demand-pools/{id}/allocations      — view 9A.2 allocation results
 import asyncio
 import logging
 from uuid import UUID
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
+from fastapi.responses import StreamingResponse
 
 from app.services.offer_engine import run_offer_generation
 from app.services.allocation import allocate_orders_for_pool
@@ -193,15 +194,26 @@ async def generate_multi_product_offers(pool_id: UUID):
         
     if generation_result.get("validated_offers", 0) > 0:
         try:
-            # 2. Run Buyer Agent
+            # 2. Run Buyer Agent (LLM decides → backend computes → validator gates)
             buyer_result = run_bundle_buyer_agent(str(pool_id))
             generation_result["buyer_agent"] = buyer_result
             
-            # 3. Execute Allocation
+            # 3. Execute Allocation ONLY if validator passed
             allocation_plan = buyer_result.get("allocation_plan", [])
-            if allocation_plan:
+            validation_passed = buyer_result.get("validation_passed", False)
+            
+            if allocation_plan and validation_passed:
                 alloc_result = allocate_bundle_orders(str(pool_id), allocation_plan)
                 generation_result["allocation"] = alloc_result
+            elif allocation_plan and not validation_passed:
+                logger.error(
+                    f"[generate-multi-offers] Buyer agent plan REJECTED by validator "
+                    f"for pool {pool_id}. Errors: {buyer_result.get('validation_errors', [])}"
+                )
+                generation_result["allocation_error"] = (
+                    f"Validator rejected the allocation plan: "
+                    f"{buyer_result.get('validation_errors', [])}"
+                )
             else:
                 logger.warning(f"No allocation plan generated for multi-product pool {pool_id}")
                 
@@ -209,5 +221,46 @@ async def generate_multi_product_offers(pool_id: UUID):
             logger.error(f"Bundle allocation failed for pool {pool_id}: {exc}", exc_info=True)
             generation_result["allocation_error"] = str(exc)
             
-    return generation_result
+@router.post("/multi-product-pools/{pool_id}/negotiate")
+async def negotiate_multi_product_pool(pool_id: UUID, background_tasks: BackgroundTasks):
+    """
+    Triggers the real-time 2-round negotiation.
+    Runs asynchronously in the background. The dashboard will connect to /stream.
+    """
+    from app.services.bundle_negotiation_engine import run_bundle_negotiation
+    
+    # Run negotiation in background so the request returns immediately and frontend can connect to stream
+    background_tasks.add_task(run_bundle_negotiation, str(pool_id))
+    
+    return {"status": "started", "message": "Negotiation started in background"}
+
+
+@router.get("/multi-product-pools/{pool_id}/negotiation/stream")
+async def stream_negotiation(pool_id: UUID, request: Request):
+    """
+    SSE endpoint for live negotiation dashboard.
+    """
+    from app.services.bundle_negotiation_engine import sse_generator
+    return StreamingResponse(sse_generator(request, str(pool_id)), media_type="text/event-stream")
+
+
+@router.get("/multi-product-pools/{pool_id}/negotiation-rounds")
+def get_multi_product_negotiation_rounds(pool_id: UUID):
+    """
+    Fetch the live feed of negotiation rounds for a pool (polling fallback/initial load).
+    """
+    from app.db.client import get_supabase
+    sb = get_supabase()
+    
+    rounds = sb.table("bundle_negotiation_rounds").select("*").eq(
+        "multi_product_pool_id", str(pool_id)
+    ).order("round_number").order("created_at").execute().data
+    
+    pool = sb.table("multi_product_pools").select("negotiation_status, total_rounds").eq("id", str(pool_id)).single().execute().data
+    
+    return {
+        "pool_id": str(pool_id), 
+        "status": pool.get("negotiation_status") if pool else "unknown",
+        "rounds": rounds
+    }
 

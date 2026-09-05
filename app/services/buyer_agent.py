@@ -13,6 +13,7 @@ from uuid import UUID
 from app.db.client import get_supabase
 from app.services.llm_client import call_with_fallback
 from app.services.shopify_inventory import get_stock_with_fallback
+from app.services.rag_retrieval import resolve_merchant_sku
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ def _fetch_validated_offers(pool_id: str) -> list[dict]:
     return resp.data or []
 
 
-def _fetch_merchant_stock(merchant_id: str, sku: str) -> int:
+def _fetch_merchant_stock(merchant_id: str, sku: str | None) -> int:
     qty, source = get_stock_with_fallback(merchant_id, sku)
     logger.info(
         "[buyer_agent] Stock resolved merchant=%s sku=%s qty=%s source=%s",
@@ -142,21 +143,25 @@ def run_buyer_agent(pool_id: str, product_id: str, total_demand_qty: int) -> dic
         return {"ranking": [], "allocation_plan": []}
 
     # Attach list price for effective value calculation
-    product_resp = supabase.table("products").select("price,sku").eq("id", product_id).execute()
+    product_resp = supabase.table("products").select("price,sku,product_group_id,title").eq("id", product_id).execute()
     if not product_resp.data:
         raise ValueError(f"No product found for product_id={product_id} — check caller is passing a real product ID, not a product_group_id")
     list_price = float(product_resp.data[0]["price"]) if product_resp.data[0].get("price") else 0.0
-    product_sku = product_resp.data[0].get("sku") or ""
+    product_group_id = product_resp.data[0].get("product_group_id")
     for o in offers:
         o["list_price"] = list_price
 
     # Pre-rank by effective value descending
     offers.sort(key=_compute_effective_value, reverse=True)
 
-    merchant_stock = {
-        o["merchant_id"]: _fetch_merchant_stock(o["merchant_id"], product_sku)
-        for o in offers
-    }
+    merchant_stock = {}
+    for offer in offers:
+        merchant_id = offer["merchant_id"]
+        merchant_sku = (
+            resolve_merchant_sku(merchant_id, product_group_id, product_resp.data[0].get("title", ""))
+            if product_group_id else product_resp.data[0].get("sku")
+        )
+        merchant_stock[merchant_id] = _fetch_merchant_stock(merchant_id, merchant_sku)
 
     user_content = _build_user_content(offers, total_demand_qty, merchant_stock)
 

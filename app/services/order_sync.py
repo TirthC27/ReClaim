@@ -71,18 +71,20 @@ def create_shopify_order(order_id: str) -> dict:
     except Exception as exc:
         logger.warning(f"Failed to fetch variant for product {shopify_product_id}: {exc}")
 
-    # ── Get customer email from the original cart ────────────
+    # ── Get customer email and quantity from the original cart ────────────
     customer_email = None
+    quantity = 1
     if order.get("demand_signal_id"):
-        signal = sb.table("demand_signals").select("cart_id").eq("id", order["demand_signal_id"]).execute().data
+        signal = sb.table("demand_signals").select("cart_id, quantity").eq("id", order["demand_signal_id"]).execute().data
         if signal:
+            quantity = signal[0].get("quantity", 1)
             cart = sb.table("carts").select("customer_email").eq("id", signal[0]["cart_id"]).execute().data
             if cart and cart[0].get("customer_email"):
                 customer_email = cart[0]["customer_email"]
 
     # ── Create Shopify order ─────────────────────────────────
     line_item = {
-        "quantity": 1,
+        "quantity": int(quantity or 1),
         "price": str(offer.get("price", 0)),
     }
     if variant_id:

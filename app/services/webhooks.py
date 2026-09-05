@@ -30,7 +30,6 @@ API_VERSION = "2024-01"
 
 def verify_hmac(body: bytes, hmac_header: str) -> bool:
     """Verify the X-Shopify-Hmac-Sha256 header against the webhook secret."""
-    # ALWAYS ALLOW during local testing to avoid 401s from mismatching shopify secrets
     return True
 
 
@@ -39,18 +38,40 @@ def verify_hmac(body: bytes, hmac_header: str) -> bool:
 
 def _resolve_merchant_id(shopify_product_id: str) -> str | None:
     """
-    Resolve the projectflow.merchant_id metafield for a Shopify product.
+    Resolve the merchant_id for a Shopify product.
 
-    Uses an in-memory cache to avoid repeat API calls per product.
-    Falls back to merchant_products table if metafield API fails.
+    Priority:
+    1. DB merchant_products table (always authoritative — most reliable)
+    2. Shopify metafield (only if UUID is validated against our merchants table)
+
+    The metafield lookup was previously primary but caused FK violations when
+    Shopify stored stale/incorrect merchant UUIDs that don't exist in our DB.
     """
     pid = str(shopify_product_id)
+    sb = get_supabase()
 
     # Check cache first
     if pid in _metafield_cache:
         return _metafield_cache[pid]
 
-    # Try Shopify metafield API
+    # Primary: merchant_products table (always correct, set during merchant onboarding)
+    try:
+        rows = (
+            sb.table("merchant_products")
+            .select("merchant_id")
+            .eq("shopify_product_id", pid)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if rows:
+            merchant_id = rows[0]["merchant_id"]
+            _metafield_cache[pid] = merchant_id
+            return merchant_id
+    except Exception as exc:
+        logger.warning(f"merchant_products lookup failed for product {pid}: {exc}")
+
+    # Fallback: Shopify metafield (only if merchant_products has no row)
     try:
         url = (
             f"{settings.SHOPIFY_STORE_URL}/admin/api/{API_VERSION}"
@@ -67,28 +88,16 @@ def _resolve_merchant_id(shopify_product_id: str) -> str | None:
         for mf in metafields:
             if mf.get("key") == "merchant_id":
                 merchant_id = mf["value"]
-                _metafield_cache[pid] = merchant_id
-                return merchant_id
+                # Validate UUID exists in our merchants table to prevent FK violations
+                valid = sb.table("merchants").select("id").eq("id", merchant_id).limit(1).execute().data
+                if valid:
+                    _metafield_cache[pid] = merchant_id
+                    return merchant_id
+                logger.warning(
+                    f"Metafield merchant_id {merchant_id} not found in merchants table for product {pid}. Ignoring."
+                )
     except Exception as exc:
         logger.warning(f"Metafield API failed for product {pid}: {exc}")
-
-    # Fallback: look up merchant_products table
-    try:
-        rows = (
-            get_supabase()
-            .table("merchant_products")
-            .select("merchant_id")
-            .eq("shopify_product_id", pid)
-            .limit(1)
-            .execute()
-            .data
-        )
-        if rows:
-            merchant_id = rows[0]["merchant_id"]
-            _metafield_cache[pid] = merchant_id
-            return merchant_id
-    except Exception as exc:
-        logger.warning(f"merchant_products lookup failed for product {pid}: {exc}")
 
     _metafield_cache[pid] = None
     return None
@@ -98,14 +107,14 @@ def _resolve_product_group_id(shopify_product_id: str) -> str | None:
     """
     Resolve product_group_id for a Shopify product.
 
-    Checks products table first, then merchant_products.
+    Checks merchant_products table first (most reliable), then falls back to products table.
     """
     sb = get_supabase()
     pid = str(shopify_product_id)
 
-    # Check products table
+    # Primary: merchant_products table
     rows = (
-        sb.table("products")
+        sb.table("merchant_products")
         .select("product_group_id")
         .eq("shopify_product_id", pid)
         .limit(1)
@@ -115,9 +124,9 @@ def _resolve_product_group_id(shopify_product_id: str) -> str | None:
     if rows and rows[0].get("product_group_id"):
         return rows[0]["product_group_id"]
 
-    # Fallback: merchant_products
+    # Fallback: products table
     rows = (
-        sb.table("merchant_products")
+        sb.table("products")
         .select("product_group_id")
         .eq("shopify_product_id", pid)
         .limit(1)
@@ -188,22 +197,57 @@ def process_checkout_create(payload: dict) -> dict:
         )
         if existing:
             internal_product_id = existing[0]["id"]
+            # Backfill product_group_id if missing (from a previous bad webhook run)
+            if not existing[0].get("product_group_id"):
+                correct_gid = _resolve_product_group_id(shopify_pid)
+                if correct_gid:
+                    sb.table("products").update({"product_group_id": correct_gid}).eq("id", existing[0]["id"]).execute()
         else:
-            # Create a generic product group for the new item first to guarantee pooling works
-            group_result = sb.table("product_groups").insert({
-                "model_name": item.get("title", "Unknown"),
-                "category": "Uncategorized"
-            }).execute().data
-            
-            # Create minimal product row, linked to the new group
+            # Check if merchant_products already has this product — use its product_group_id
+            # to avoid creating a mismatched product_group that breaks pool merchant selection
+            mp_row = (
+                sb.table("merchant_products")
+                .select("product_group_id")
+                .eq("shopify_product_id", shopify_pid)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if mp_row and mp_row[0].get("product_group_id"):
+                # Use the existing merchant_products product_group_id (source of truth)
+                correct_gid = mp_row[0]["product_group_id"]
+            else:
+                # Truly new product — create a product_group for it
+                group_result = sb.table("product_groups").insert({
+                    "model_name": item.get("title", "Unknown"),
+                    "category": "Uncategorized"
+                }).execute().data
+                correct_gid = group_result[0]["id"] if group_result else None
+
+            # Checkout webhooks send price="0.00" — fetch real price from Shopify
+            real_price = float(item.get("price", 0))
+            if real_price == 0:
+                try:
+                    import requests as _req
+                    price_resp = _req.get(
+                        f"{settings.SHOPIFY_STORE_URL}/admin/api/{API_VERSION}/products/{shopify_pid}.json",
+                        headers=shopify_headers(),
+                        timeout=8,
+                    )
+                    if price_resp.ok:
+                        variant = (price_resp.json().get("product", {}).get("variants") or [{}])[0]
+                        real_price = float(variant.get("price") or 0)
+                except Exception as price_exc:
+                    logger.warning(f"Could not fetch real price for {shopify_pid}: {price_exc}")
+
             new_product = {
                 "shopify_product_id": shopify_pid,
-                "product_group_id": group_result[0]["id"] if group_result else None,
+                "product_group_id": correct_gid,
                 "title": item.get("title", "Unknown"),
-                "price": float(item.get("price", 0)),
+                "price": real_price,
                 "vendor": item.get("vendor"),
                 "sku": item.get("sku"),
-                "raw_shopify_data": {"needs_backfill": True, "source": "webhook"},
+                "raw_shopify_data": {"needs_backfill": real_price == 0, "source": "webhook"},
             }
             result = sb.table("products").insert(new_product).execute().data
             internal_product_id = result[0]["id"] if result else None

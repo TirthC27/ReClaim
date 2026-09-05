@@ -86,43 +86,44 @@ def check_abandoned_carts():
                 if signal.get("product_group_id"):
                     affected_groups.add(signal["product_group_id"])
 
-            # ── Create cart_recoveries record ───────────────
-            if signals:
-                existing_recovery = (sb.table("cart_recoveries").select("id")
-                    .eq("cart_id", str(cart_id)).order("created_at", desc=True)
-                    .limit(1).execute().data)
-                if existing_recovery:
-                    recovery_id = existing_recovery[0]["id"]
-                    sb.table("cart_recoveries").update({
-                        "customer_email": customer_email,
-                    }).eq("id", recovery_id).execute()
-                    rec_result = [{"id": recovery_id}]
-                    logger.info("Reusing cart_recovery %s for cart %s", recovery_id, cart_id)
-                else:
-                    recovery = {
-                        "cart_id": str(cart_id),
-                        "customer_email": customer_email,
-                        "status": "awaiting_offers",
-                        "expires_at": (datetime.now(timezone.utc) + timedelta(
-                            hours=settings.POOL_WINDOW_HOURS
-                        )).isoformat(),
-                    }
-                    rec_result = sb.table("cart_recoveries").insert(recovery).execute().data
+            # ── Create cart_recoveries record (always, even with 0 signals) ───────────────
+            recovery_id = None
+            existing_recovery = (sb.table("cart_recoveries").select("id")
+                .eq("cart_id", str(cart_id)).order("created_at", desc=True)
+                .limit(1).execute().data)
+            if existing_recovery:
+                recovery_id = existing_recovery[0]["id"]
+                sb.table("cart_recoveries").update({
+                    "customer_email": customer_email,
+                }).eq("id", recovery_id).execute()
+                logger.info("Reusing cart_recovery %s for cart %s", recovery_id, cart_id)
+            else:
+                recovery = {
+                    "cart_id": str(cart_id),
+                    "customer_email": customer_email,
+                    "status": "awaiting_offers",
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(
+                        hours=settings.POOL_WINDOW_HOURS
+                    )).isoformat(),
+                }
+                rec_result = sb.table("cart_recoveries").insert(recovery).execute().data
                 if rec_result:
                     recovery_id = rec_result[0]["id"]
-                    # Insert items
-                    linked = (sb.table("cart_recovery_items").select("demand_signal_id")
-                              .eq("cart_recovery_id", recovery_id).execute().data)
-                    linked_ids = {row["demand_signal_id"] for row in linked}
-                    recovery_items = []
-                    for sig in signals:
-                        if sig["id"] not in linked_ids:
-                            recovery_items.append({
-                                "cart_recovery_id": recovery_id,
-                                "demand_signal_id": sig["id"]
-                            })
-                    if recovery_items:
-                        sb.table("cart_recovery_items").insert(recovery_items).execute()
+                    logger.info("Created cart_recovery %s for cart %s", recovery_id, cart_id)
+                else:
+                    recovery_id = None
+
+            if recovery_id and signals:
+                # Insert items for signals not yet linked
+                linked = (sb.table("cart_recovery_items").select("demand_signal_id")
+                          .eq("cart_recovery_id", recovery_id).execute().data)
+                linked_ids = {row["demand_signal_id"] for row in linked}
+                recovery_items = [
+                    {"cart_recovery_id": recovery_id, "demand_signal_id": sig["id"]}
+                    for sig in signals if sig["id"] not in linked_ids
+                ]
+                if recovery_items:
+                    sb.table("cart_recovery_items").insert(recovery_items).execute()
 
             logger.info(
                 f"Cart {cart_id} abandoned: "
@@ -138,7 +139,16 @@ def check_abandoned_carts():
             cart_type = classify_cart(cart_id)
             if cart_type == "multi":
                 try:
-                    aggregate_multi_product_demand(cart_id)
+                    pool = aggregate_multi_product_demand(cart_id)
+                    # Explicitly update cart_recovery with pool link
+                    # (aggregate_multi_product_demand updates by cart_id, but the recovery
+                    #  may have just been created above — ensure it's always synced)
+                    if pool:
+                        pool_id = pool["id"]
+                        sb.table("cart_recoveries").update({
+                            "pool_type": "multi",
+                            "multi_product_pool_id": pool_id,
+                        }).eq("cart_id", cart_id).execute()
                 except Exception as exc:
                     logger.error(f"Multi-product aggregation failed for cart {cart_id}: {exc}")
 
@@ -177,6 +187,16 @@ def retry_failed_shopify_orders():
             create_shopify_order(row["id"])
         except Exception as exc:
             logger.error(f"Retry Shopify order failed for {row['id']}: {exc}")
+
+    recovery_rows = (sb.table("cart_recoveries").select("id")
+        .eq("status", "paid").eq("order_creation_failed", True)
+        .is_("shopify_order_id", "null").limit(20).execute().data)
+    from app.services.shopify_orders import create_shopify_cart_recovery_order
+    for row in recovery_rows or []:
+        try:
+            create_shopify_cart_recovery_order(row["id"])
+        except Exception as exc:
+            logger.error(f"Retry Shopify recovery order failed for {row['id']}: {exc}")
 
 
 def expire_unpaid_offers():

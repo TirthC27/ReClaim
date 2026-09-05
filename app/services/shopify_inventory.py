@@ -74,32 +74,40 @@ def get_live_stock(merchant_id: str, sku: str | None = None, inventory_item_id: 
 
     if inventory_item_id:
         # Fast path if we already know the inventory_item_id
-        mapping = sb.table("merchant_products").select("*").eq("merchant_id", merchant_id).eq("inventory_item_id", inventory_item_id).limit(1).execute().data
-        if mapping:
-            mapping = mapping[0]
+        mapping_data = sb.table("merchant_products").select("*").eq("merchant_id", merchant_id).eq("inventory_item_id", inventory_item_id).limit(1).execute().data
+        if mapping_data:
+            mapping = mapping_data[0]
             sku = sku or "unknown" # Fallback so logs don't break
 
     if not mapping and sku:
-        master = sb.table("products").select("product_group_id,title").eq(
-            "sku", sku
-        ).limit(1).execute().data or []
+        # First try new exact mapping by quotation_sku
+        mapping_data = sb.table("merchant_products").select("*").eq("merchant_id", merchant_id).eq("quotation_sku", sku).limit(1).execute().data
+        if mapping_data:
+            mapping = mapping_data[0]
+
+    # If inventory_item_id is missing but we have shopify_product_id, auto-resolve it
+    if mapping and not mapping.get("inventory_item_id") and mapping.get("shopify_product_id"):
+        info = resolve_inventory_item_id(mapping["shopify_product_id"])
+        if info and info.get("inventory_item_id"):
+            inventory_item_id = info["inventory_item_id"]
+            mapping["inventory_item_id"] = inventory_item_id
+            # Update DB for next time
+            sb.table("merchant_products").update({"inventory_item_id": inventory_item_id}).eq("id", mapping["id"]).execute()
+            logger.info("Auto-resolved inventory_item_id %s for mapping %s", inventory_item_id, mapping["id"])
+
+    # Older brute-force logic for backward compatibility
+    if not mapping and sku:
+        master = sb.table("products").select("product_group_id,title").eq("sku", sku).limit(1).execute().data or []
         if not master:
             if not sku:
-                logger.warning("No product found for live inventory and SKU is empty. Aborting brute-force lookup.")
+                logger.warning("No product found for live inventory and SKU is empty.")
                 return None
-
             # Vendor SKUs may exist only in Shopify when products are grouped
-            # under a shared marketplace product. Resolve the exact mapping by
-            # Shopify variant SKU before giving up.
-            mappings = (sb.table("merchant_products").select("*")
-                        .eq("merchant_id", merchant_id)
-                        .not_.is_("inventory_item_id", "null")
-                        .execute().data or [])
+            mappings = sb.table("merchant_products").select("*").eq("merchant_id", merchant_id).not_.is_("inventory_item_id", "null").execute().data or []
             for candidate in mappings:
                 info = resolve_inventory_item_id(candidate.get("shopify_product_id", ""))
                 if info and info.get("sku") == sku:
-                    master = [{"product_group_id": candidate.get("product_group_id"),
-                               "title": info.get("title", "")}]
+                    master = [{"product_group_id": candidate.get("product_group_id"), "title": info.get("title", "")}]
                     break
             if not master:
                 logger.warning("No product found for live inventory sku=%s", sku)
@@ -107,24 +115,18 @@ def get_live_stock(merchant_id: str, sku: str | None = None, inventory_item_id: 
 
         try:
             group_id = master[0].get("product_group_id")
-            query = sb.table("merchant_products").select("*").eq(
-                "merchant_id", merchant_id
-            )
+            query = sb.table("merchant_products").select("*").eq("merchant_id", merchant_id)
             if group_id:
                 query = query.eq("product_group_id", group_id)
             else:
                 query = query.is_("product_group_id", "null")
             rows = query.execute().data or []
         except Exception as exc:
-            # Keep older deployments functional until migration 010 is applied.
             logger.error("Inventory cache schema unavailable: %s", exc)
             return None
+            
         if not rows:
-            # Older data can have a missing/stale local product_group_id. Inspect
-            # all resolved merchant mappings and match the Shopify product title.
-            rows = sb.table("merchant_products").select("*").eq(
-                "merchant_id", merchant_id
-            ).not_.is_("inventory_item_id", "null").execute().data or []
+            rows = sb.table("merchant_products").select("*").eq("merchant_id", merchant_id).not_.is_("inventory_item_id", "null").execute().data or []
 
         if len(rows) > 1 or (rows and not group_id):
             local_tokens = set((master[0].get("title") or "").lower().split())
@@ -138,26 +140,21 @@ def get_live_stock(merchant_id: str, sku: str | None = None, inventory_item_id: 
                         score += 100
                     scored.append((score, candidate))
                 except Exception as exc:
-                    logger.warning(
-                        "Unable to inspect Shopify mapping=%s for merchant=%s sku=%s: %s",
-                        candidate.get("id"), merchant_id, sku, exc,
-                    )
+                    pass
             if scored:
                 rows = [max(scored, key=lambda pair: pair[0])[1]]
-                if not group_id:
-                    logger.warning(
-                        "Matched inventory despite missing local group merchant=%s sku=%s mapping=%s",
-                        merchant_id, sku, rows[0].get("id"),
-                    )
+                
         if not rows:
             logger.warning("No merchant product mapping for merchant=%s sku=%s", merchant_id, sku)
             return None
         mapping = rows[0]
         inventory_item_id = mapping.get("inventory_item_id")
 
-    if not mapping or not inventory_item_id:
+    if not mapping or not mapping.get("inventory_item_id"):
         logger.warning("No inventory_item_id for merchant=%s sku=%s", merchant_id, sku)
         return None
+    
+    inventory_item_id = mapping.get("inventory_item_id")
 
     cached_at = mapping.get("stock_cached_at")
     if cached_at:

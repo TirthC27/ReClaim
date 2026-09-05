@@ -93,6 +93,13 @@ def send_finalized_offer_email(cart_recovery_id: str):
     line_items = []
     for i in items:
         merchant_id = i.get("merchant_id")
+        # Get the real quantity from demand_signals (not hardcoded 1)
+        actual_qty = int(i.get("demand_signals", {}).get("quantity", 1) or 1)
+        # cart_recovery_items.price stores line_total (unit_price × quantity)
+        # Shopify expects unit price — it multiplies by quantity internally
+        line_total = float(i.get("price") or 0)
+        shopify_unit_price = round(line_total / actual_qty, 2) if actual_qty > 0 else line_total
+
         if merchant_id:
             product_group_id = i.get("demand_signals", {}).get("product_group_id")
             mp_rows = sb.table("merchant_products").select("shopify_product_id").eq("merchant_id", str(merchant_id)).eq("product_group_id", str(product_group_id)).limit(1).execute().data
@@ -101,8 +108,8 @@ def send_finalized_offer_email(cart_recovery_id: str):
                 variant_id = _resolve_variant_id(shopify_product_id)
                 line_items.append({
                     "variant_id": variant_id,
-                    "quantity": 1,
-                    "price": str(i.get("price"))
+                    "quantity": actual_qty,
+                    "price": str(shopify_unit_price)
                 })
         else:
             # Ungrouped/original item
@@ -114,8 +121,8 @@ def send_finalized_offer_email(cart_recovery_id: str):
                     variant_id = _resolve_variant_id(shopify_product_id)
                     line_items.append({
                         "variant_id": variant_id,
-                        "quantity": 1,
-                        "price": str(i.get("price"))
+                        "quantity": actual_qty,
+                        "price": str(shopify_unit_price)
                     })
 
     draft_resp = requests.post(
@@ -143,6 +150,24 @@ def send_finalized_offer_email(cart_recovery_id: str):
         "shopify_draft_order_id": str(draft_order["id"]),
         "razorpay_payment_link_id": str(payment_link["id"]),
     }).eq("id", cart_recovery_id).execute()
+
+    # Keep a durable payment row for the bundle payment path. The Razorpay
+    # webhook uses this row to persist the payment ID and raw event payload.
+    bundle_offer_ids = list({
+        i.get("bundle_offer_id") for i in items if i.get("bundle_offer_id")
+    })
+    if bundle_offer_ids:
+        existing_payment = (sb.table("payments").select("id")
+            .eq("bundle_offer_id", bundle_offer_ids[0])
+            .eq("razorpay_payment_link_id", str(payment_link["id"]))
+            .limit(1).execute().data)
+        if not existing_payment:
+            sb.table("payments").insert({
+                "bundle_offer_id": bundle_offer_ids[0],
+                "razorpay_payment_link_id": str(payment_link["id"]),
+                "amount": float(recovery.get("total_price") or 0),
+                "status": "created",
+            }).execute()
 
 
 def check_and_finalize_cart_recovery(cart_recovery_id: str):
@@ -314,7 +339,7 @@ def allocate_orders_for_pool(pool_id: str, product_id: str, total_demand_qty: in
         }
         logger.info(f"[allocation] Attempting to insert allocation for signal {signal['id']}: {alloc}")
         try:
-            alloc_res = sb.table("order_allocations").insert(alloc).execute()
+            alloc_res = sb.table("order_allocations").upsert(alloc, on_conflict="demand_signal_id").execute()
             if alloc_res.data:
                 result = alloc_res.data[0]
                 logger.info(f"[allocation] Insert successful: {result}")
