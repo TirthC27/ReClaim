@@ -62,7 +62,6 @@
 │       ├── shopify_auth.py
 │       ├── shopify_orders.py
 │       └── webhooks.py
-├── generate_context.py
 ├── merchant-dashboard
 │   ├── .gitignore
 │   ├── .oxlintrc.json

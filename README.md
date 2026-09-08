@@ -70,7 +70,6 @@ FastAPI + Uvicorn
 ├── requirements.txt               # Python dependencies
 ├── API.md                         # Expanded API reference and examples
 ├── .env.example                   # Environment variable template
-└── run_migration.py               # Local migration helper; review before use
 ```
 
 ### Backend layers
@@ -392,12 +391,7 @@ The [Dockerfile](Dockerfile) uses Python 3.11, installs `requirements.txt`, copi
 
 ## Testing and verification
 
-The repository currently contains exploratory scripts rather than a complete automated test suite:
-
-- `test_audit.py` performs live Supabase inspection.
-- `test_offers.py` runs offer generation against configured data and external services.
-
-These scripts require credentials and may mutate external data. Recommended test priorities are:
+The repository does not yet contain a complete automated test suite. Recommended test priorities are:
 
 1. Shopify and Razorpay signature verification.
 2. Offer-selection ownership and cross-pool authorization.
